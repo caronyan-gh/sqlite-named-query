@@ -169,7 +169,7 @@ def split_statements(sql):
 def parse_query(path):
     with open(path, encoding="utf-8-sig") as fh:  # -sig: tolerate a BOM (e.g. Notepad)
         sql = fh.read()
-    desc, mode, exports = None, None, []
+    desc, mode, exports, notes = None, None, [], []
     for line in sql.splitlines():
         s = line.strip()
         if not s:
@@ -185,6 +185,8 @@ def parse_query(path):
             exports += [e.strip() for e in x.group(1).split(",") if e.strip()]
         elif desc is None and body:
             desc = body
+        elif body:
+            notes.append(body)
     stmts = split_statements(sql)
     code = [strip_comments_and_strings(s) for s in stmts]
     inferred = "read" if code and all(READ_START.match(c) and not WRITE_WORDS.search(c) for c in code) else "write"
@@ -194,7 +196,7 @@ def parse_query(path):
             if p not in params:
                 params.append(p)
     return {"sql": sql, "statements": stmts, "code": code, "description": desc, "exports": exports,
-            "mode": mode or inferred, "declaredMode": mode, "inferredMode": inferred, "params": params}
+            "mode": mode or inferred, "declaredMode": mode, "inferredMode": inferred, "params": params, "notes": notes}
 
 
 def run_export(root, db, name, params):
@@ -303,7 +305,12 @@ def cmd_run(args, root):
     missing = [p for p in q["params"] if p not in params]
     extra = [p for p in params if p not in q["params"]]
     if missing or extra:
-        fail(name, "parameter mismatch", missing=missing, unexpected=extra, expected=q["params"], hint=LIST_HINT)
+        # The definition is already loaded, so hand back what the query is and what its parameters mean
+        # (usually written in the header comments) and save the caller a round trip.
+        about = {"description": q["description"]}
+        if q["notes"]:
+            about["notes"] = q["notes"]
+        fail(name, "parameter mismatch", missing=missing, unexpected=extra, expected=q["params"], **about, hint=LIST_HINT)
     read_only = q["mode"] == "read"
     if read_only and len(q["statements"]) != 1:
         fail(name, "a read query must contain exactly one statement")
