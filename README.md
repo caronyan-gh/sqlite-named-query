@@ -43,7 +43,7 @@ The agent adds the tables and queries for it, and from then on keeps the list up
 ## Features
 
 - **External memory for your agent — store generously, read sparingly.** State lives in the database, not in the context window. It survives new sessions and context compaction, and the agent pulls back just the rows and columns it needs as JSON — so long projects don't drown the context. When something doesn't add up, it can pull the whole history instead of digging through old conversations.
-- **Built for teamwork.** Several agents, sessions, and humans share one source of truth, and simultaneous writes wait their turn instead of breaking. Battle-tested on a multi-agent development project: when the implementer ran out of quota mid-project, a different AI took over from the database and carried on as if nothing happened (see the appendix in [`SKILL.md`](sqlite-named-query/SKILL.md)).
+- **Built for teamwork.** Several agents, sessions, and humans share one source of truth, and simultaneous writes wait their turn instead of breaking. Battle-tested on a multi-agent development project: when the implementer ran out of quota mid-project, a different AI took over from the database and carried on as if nothing happened (see [lessons from real use](sqlite-named-query/references/lessons.md)).
 - **Plays well with git and other tools.** Every write can refresh plain Markdown files: humans can read them, git tracks their history, and tools such as graphify can index them. Store commit IDs in the database to link tasks and commits.
 - **Queries are files.** Every read and write the agent does is a saved `.sql` file you can look at, reuse, or put in git — nothing is run on the fly.
 - **Safe writes.** Parameters are always bound. Read queries open the database read-only. Write queries run in a single transaction and roll back on failure.
@@ -78,7 +78,7 @@ python $NQ run close_test --params '{"test_id":"T-A-001","result":"passed"}'
 cat reports/tests/SUMMARY.md
 ```
 
-See [`sqlite-named-query/SKILL.md`](sqlite-named-query/SKILL.md) for the full reference: project layout, query file headers, projections, migrations, `check`, and operating rules.
+See [`sqlite-named-query/SKILL.md`](sqlite-named-query/SKILL.md) for the full reference: project layout, query file headers, projections, migrations, `check`, and operating rules. Lessons from real use are in [`references/lessons.md`](sqlite-named-query/references/lessons.md).
 
 ## Repository layout
 
@@ -86,7 +86,9 @@ See [`sqlite-named-query/SKILL.md`](sqlite-named-query/SKILL.md) for the full re
 sqlite-named-query/
 ├─ SKILL.md                  skill definition and reference
 ├─ scripts/nq.py             the runner
-└─ references/example/db/    example migrations, queries and exports
+└─ references/
+   ├─ lessons.md             lessons from real use (read when designing a database or when stuck)
+   └─ example/db/            example migrations, queries and exports
 ```
 
 ## What it ended up doing in my project (nobody planned these)
