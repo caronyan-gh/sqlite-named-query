@@ -51,6 +51,8 @@ PARAM = re.compile(r"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")
 
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Added to errors caused by not knowing what queries exist, so the tool itself points the way (instructions get lost).
+LIST_HINT = "run `nq.py list` to see every query with its parameters and description (no need to open the .sql files)"
 
 
 def collect_params(args):
@@ -290,7 +292,7 @@ def cmd_run(args, root):
         fail(name, "invalid query name")
     path = os.path.join(root, "db", "queries", name + ".sql")
     if not os.path.isfile(path):
-        fail(name, f"unknown query: {name}")
+        fail(name, f"unknown query: {name}", hint=LIST_HINT)
     q = parse_query(path)
     if q["declaredMode"] == "read" and q["inferredMode"] == "write":
         fail(name, "query declares mode: read but contains write statements")
@@ -301,7 +303,7 @@ def cmd_run(args, root):
     missing = [p for p in q["params"] if p not in params]
     extra = [p for p in params if p not in q["params"]]
     if missing or extra:
-        fail(name, "parameter mismatch", missing=missing, unexpected=extra, expected=q["params"])
+        fail(name, "parameter mismatch", missing=missing, unexpected=extra, expected=q["params"], hint=LIST_HINT)
     read_only = q["mode"] == "read"
     if read_only and len(q["statements"]) != 1:
         fail(name, "a read query must contain exactly one statement")
