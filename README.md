@@ -32,7 +32,7 @@ Most agent-memory tools give you a fixed API (`remember` / `recall`). This one g
 
    > Anything you'd like to add?
 
-   The agent looks back at what it keeps looking up or re-deriving by hand, and suggests new tables or queries for it.
+   The agent looks back at what it keeps looking up or re-deriving by hand, and suggests new tables or queries for it. (The [kaizen](https://github.com/caronyan-gh/kaizen) skill turns this into a ranked review that remembers what you declined, and records it in this database.)
 
 **Bonus:** you can also ask for something specific, any time:
 
