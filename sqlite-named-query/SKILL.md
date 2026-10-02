@@ -77,6 +77,7 @@ NQ=<path-to-this-skill>/scripts/nq.py
 python $NQ migrate                  # create / upgrade the database
 python $NQ status                   # applied and pending migrations
 python $NQ list                     # queries with mode, parameters (name, type, meaning), exports, description
+python $NQ list duration            # search: words are case-insensitive regexes ('duration|timing', '^task_')
 python $NQ run get_open_test
 python $NQ run close_test --params '{"test_id":"T-A-001","result":"passed"}'
 python $NQ export test_summary      # run a projection by hand
@@ -127,6 +128,7 @@ Document parameters and result columns in the header, so callers never need to o
 -- column via: where the link was found (traceability | tests | graph)
 ```
 
+- Before writing any SQL of your own, search for an existing query with `list <word>`: it matches names, descriptions, and parameter and column docs. "No match" also returns every query's name and description, so an empty search never means "no such query" by itself.
 - `list` shows each parameter as `{"name", "type", "doc"}` (missing keys are omitted), and a parameter-mismatch error shows the same. Columns documented with `-- column` appear as `columns` in `list` and in every result of that query. Add a doc only where a name is not self-explanatory: null meaning "all", units, allowed values, JSON shape.
 - `check` reports a `-- param` or `-- column` line that names something the query does not have, so docs cannot silently go stale.
 - Use SQLite named parameters (`:name`). Values are always bound; never build SQL by string concatenation.

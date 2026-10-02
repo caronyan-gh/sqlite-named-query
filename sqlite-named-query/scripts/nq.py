@@ -7,8 +7,11 @@ Queries live in the project, not in this script:
     <root>/db/project.db              the database (default path; an existing <root>/project.db is still used)
 
 Commands
-    list                         query names with description, mode (read/write), parameters (name, type, doc)
-                                 and documented result columns
+    list [WORD ...]              query names with description, mode (read/write), parameters (name, type, doc)
+                                 and documented result columns. With words: only queries whose name, description,
+                                 notes, parameter or column docs match every word (each a case-insensitive regex:
+                                 duration|timing, ^task_, history$; invalid patterns are plain text); with no match
+                                 it says "no match" and returns every query's name and description instead
     run NAME [--params JSON | --params-file F] [--param K=V ...] [--param-file K=PATH ...] [--raw COLUMN]
                                  run a named query; parameters are bound (never string-concatenated).
                                  --param-file feeds a text file (e.g. a markdown body) as one parameter;
@@ -58,7 +61,8 @@ PARAM = re.compile(r"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Added to errors caused by not knowing what queries exist, so the tool itself points the way (instructions get lost).
-LIST_HINT = "run `nq.py list` to see every query with its parameters and description (no need to open the .sql files)"
+LIST_HINT = ("run `nq.py list` to see every query with its parameters and description, or `nq.py list <word>` to "
+             "search them (no need to open the .sql files)")
 PARAM_DECL = re.compile(r"param\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+([A-Za-z]+))?\s*(?::\s*(.*))?$", re.I)
 COLUMN_DECL = re.compile(r"column\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*(.*))?$", re.I)
 PARAM_TYPES = ("json", "text")
@@ -351,8 +355,36 @@ def cmd_list(args, root):
             item = {"name": fn[:-4], "mode": q["mode"], "params": param_info(q), "exports": q["exports"], "description": q["description"]}
             if q["column_docs"]:
                 item["columns"] = q["column_docs"]
-            items.append(item)
-    emit({"ok": True, "root": root, "queries": items})
+            items.append((item, q))
+    words = getattr(args, "keyword", None) or []
+    if not words:
+        emit({"ok": True, "root": root, "queries": [i for i, _ in items]})
+
+    def pattern(word):
+        # Each word is a case-insensitive regular expression (duration|timing, ^task_, history$); a word that is not
+        # a valid pattern is searched as plain text. ^ and $ apply per line; the name is a line of its own, and
+        # parameter / column lines start with "param " / "column ", so ^task_ matches query names only.
+        try:
+            return re.compile(word, re.I | re.M)
+        except re.error:
+            return re.compile(re.escape(word), re.I)
+
+    def haystack(item, q):
+        parts = [item["name"], item["description"] or ""] + q["notes"]
+        for p in item["params"]:
+            parts.append(f"param {p['name']}: {p.get('doc') or ''}")
+        for c, doc in q["column_docs"].items():
+            parts.append(f"column {c}: {doc or ''}")
+        return "\n".join(parts)
+
+    pats = [pattern(w) for w in words]
+    hits = [i for i, q in items if all(p.search(haystack(i, q)) for p in pats)]
+    keyword = " ".join(args.keyword)
+    if hits:
+        emit({"ok": True, "root": root, "keyword": keyword, "queries": hits})
+    # An empty search is easily read as "no such query exists"; hand back every name and description instead.
+    emit({"ok": True, "root": root, "keyword": keyword, "match": 0, "message": f"no match: {keyword}",
+          "queries": [{"name": i["name"], "description": i["description"]} for i, _ in items]})
 
 
 def cmd_run(args, root):
@@ -677,7 +709,10 @@ def main():
     ap.add_argument("--root", help="project root (default: nearest ancestor containing db/queries or db/migrations)")
     ap.add_argument("--db", help="database path (default: <root>/db/project.db, or an existing <root>/project.db)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list")
+    lp = sub.add_parser("list")
+    lp.add_argument("keyword", nargs="*", help="only queries whose name, description, notes, parameter or column "
+                    "docs match every word (case-insensitive regex, e.g. 'duration|timing', '^task_'); no match "
+                    "returns all names and descriptions")
     r = sub.add_parser("run")
     r.add_argument("name")
     r.add_argument("--params", help="JSON object of named parameters")
