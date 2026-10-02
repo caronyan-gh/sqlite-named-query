@@ -76,7 +76,7 @@ NQ=<path-to-this-skill>/scripts/nq.py
 
 python $NQ migrate                  # create / upgrade the database
 python $NQ status                   # applied and pending migrations
-python $NQ list                     # queries with mode, parameters, exports, description
+python $NQ list                     # queries with mode, parameters (name, type, meaning), exports, description
 python $NQ run get_open_test
 python $NQ run close_test --params '{"test_id":"T-A-001","result":"passed"}'
 python $NQ export test_summary      # run a projection by hand
@@ -93,6 +93,8 @@ Parameters can be passed three ways, and the ways can be combined (passing the s
 | `--params '{"k":1}'` / `--params-file p.json` | Pass everything at once as a JSON object |
 | `--param k=31` (repeatable) | One at a time. The value is parsed as JSON if it is valid JSON (`31`, `null`, `true`), otherwise taken as a string |
 | `--param-file k=path.md` (repeatable) | The file's contents as a single string (for long bodies; no escaping needed) |
+
+A JSON array or object can only be passed to a parameter the query declares as `json` (see below); anywhere else it is refused before the query runs, with a message saying how to pass it.
 
 `--raw COLUMN` prints that column's value as-is instead of JSON when the result has exactly one row (for reading long bodies; byte-for-byte what was stored). It is an error if there is not exactly one row.
 
@@ -111,10 +113,22 @@ Caution: even when `--db` points at another database, exports are still written 
 -- Mark a test passed and log the run          ← first comment line is the description
 -- mode: write                                 ← read / write (inferred from the SQL if omitted)
 -- export: test_card, test_summary             ← projections to refresh after a successful write (optional)
+-- param result: free text such as passed / failed / blocked   ← what a parameter means (optional)
 UPDATE tests SET status = 'passed', last_result = :result WHERE test_id = :test_id;
 INSERT INTO test_runs(test_id, result) VALUES (:test_id, :result);
 ```
 
+Document parameters and result columns in the header, so callers never need to open the `.sql` file:
+
+```sql
+-- param items json: one run's items, [{step, rank, item, reason}]   ← json: arrays/objects are passed as JSON text
+-- param sha text: commit SHA                                         ← text: always a string (1234567 stays "1234567")
+-- param owner: role that ran it                                      ← no type: as given
+-- column via: where the link was found (traceability | tests | graph)
+```
+
+- `list` shows each parameter as `{"name", "type", "doc"}` (missing keys are omitted), and a parameter-mismatch error shows the same. Columns documented with `-- column` appear as `columns` in `list` and in every result of that query. Add a doc only where a name is not self-explanatory: null meaning "all", units, allowed values, JSON shape.
+- `check` reports a `-- param` or `-- column` line that names something the query does not have, so docs cannot silently go stale.
 - Use SQLite named parameters (`:name`). Values are always bound; never build SQL by string concatenation.
 - If the parameters you pass do not match the ones in the query (missing or extra), the query is not run and an error is returned (catches typos).
 - **read**: exactly one statement. The database is opened read-only, so writes are physically impossible. Declaring `mode: read` on a query that contains a write statement is an error.

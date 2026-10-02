@@ -7,7 +7,8 @@ Queries live in the project, not in this script:
     <root>/db/project.db              the database (default path; an existing <root>/project.db is still used)
 
 Commands
-    list                         query names with description, mode (read/write) and parameters
+    list                         query names with description, mode (read/write), parameters (name, type, doc)
+                                 and documented result columns
     run NAME [--params JSON | --params-file F] [--param K=V ...] [--param-file K=PATH ...] [--raw COLUMN]
                                  run a named query; parameters are bound (never string-concatenated).
                                  --param-file feeds a text file (e.g. a markdown body) as one parameter;
@@ -30,6 +31,11 @@ Header comments at the top of a query file (optional):
     -- Get one task by task_id          first plain comment line = description
     -- mode: read | write               default: read if every statement is SELECT/WITH/VALUES/EXPLAIN, else write
     -- export: name[, name...]          (write queries) refresh these text projections after a successful commit
+    -- param NAME [json|text]: meaning  document a parameter (shown by list and in parameter errors). json: a JSON
+                                        array/object is passed as JSON text; text: always passed as a string (a
+                                        digit-only value such as a commit SHA would otherwise become a number).
+                                        An undeclared parameter given an array/object is refused before running.
+    -- column NAME: meaning             document a result column; read results then carry a "columns" object
 
 Output is always one JSON object on stdout. Standard library only.
 """
@@ -53,13 +59,17 @@ PARAM = re.compile(r"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Added to errors caused by not knowing what queries exist, so the tool itself points the way (instructions get lost).
 LIST_HINT = "run `nq.py list` to see every query with its parameters and description (no need to open the .sql files)"
+PARAM_DECL = re.compile(r"param\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+([A-Za-z]+))?\s*(?::\s*(.*))?$", re.I)
+COLUMN_DECL = re.compile(r"column\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*(.*))?$", re.I)
+PARAM_TYPES = ("json", "text")
 
 
-def collect_params(args):
+def collect_params(args, raw=None):
     """Merge parameters from --params / --params-file (JSON object) and repeatable --param KEY=VALUE /
     --param-file KEY=PATH. A --param value is parsed as JSON when it is valid JSON (31, null, true, "x"), otherwise
     taken as a plain string. A --param-file value is the file's text, byte-for-byte (UTF-8, newlines kept).
-    The same key given twice is an error."""
+    The same key given twice is an error. If `raw` is a dict, the unparsed --param strings are stored there
+    (for parameters declared as text)."""
     params = {}
     if getattr(args, "params", None):
         params = json.loads(args.params)
@@ -82,11 +92,48 @@ def collect_params(args):
             with open(value, encoding="utf-8", newline="") as fh:
                 params[key] = fh.read()
         else:
+            if raw is not None:
+                raw[key] = value
             try:
                 params[key] = json.loads(value)
             except ValueError:
                 params[key] = value
     return params
+
+
+def bind_values(q, params, raw=None):
+    """Apply the query's declared parameter types. json: a list/dict becomes JSON text. text: the value is passed
+    as a string (the raw --param text when there is one). An undeclared parameter holding a list/dict is refused
+    here, before anything runs, because SQLite can only bind text, numbers, blobs and null."""
+    out = dict(params)
+    for name, value in params.items():
+        kind = q["param_decls"].get(name, {}).get("type")
+        if kind == "json":
+            if isinstance(value, (list, dict)):
+                out[name] = json.dumps(value, ensure_ascii=False)
+        elif kind == "text":
+            if value is None:
+                pass  # null stays NULL (callers pass null for "no filter")
+            elif raw and name in raw:
+                out[name] = raw[name]
+            elif not isinstance(value, str):
+                out[name] = json.dumps(value, ensure_ascii=False)
+        elif isinstance(value, (list, dict)):
+            shape = "array" if isinstance(value, list) else "object"
+            raise ValueError(
+                f"parameter {name} is a JSON {shape}; SQLite can only bind text, numbers and null. If the query "
+                f"expects JSON text, declare '-- param {name} json' in its header, or pass the JSON with "
+                f"--param-file {name}=FILE")
+    return out
+
+
+def param_info(q):
+    """The query's parameters in order, each as {name, type?, doc?} (absent keys are omitted)."""
+    info = []
+    for p in q["params"]:
+        d = q["param_decls"].get(p, {})
+        info.append({"name": p, **({"type": d["type"]} if d.get("type") else {}), **({"doc": d["doc"]} if d.get("doc") else {})})
+    return info
 
 
 def emit_raw(query, rows, column):
@@ -170,6 +217,7 @@ def parse_query(path):
     with open(path, encoding="utf-8-sig") as fh:  # -sig: tolerate a BOM (e.g. Notepad)
         sql = fh.read()
     desc, mode, exports, notes = None, None, [], []
+    param_decls, column_docs, bad_decls = {}, {}, []
     for line in sql.splitlines():
         s = line.strip()
         if not s:
@@ -179,10 +227,23 @@ def parse_query(path):
         body = s[2:].strip()
         m = re.match(r"mode\s*:\s*(read|write)\s*$", body, re.I)
         x = re.match(r"export\s*:\s*(.+)$", body, re.I)
+        pd = PARAM_DECL.match(body)
+        cd = COLUMN_DECL.match(body)
         if m:
             mode = m.group(1).lower()
         elif x:
             exports += [e.strip() for e in x.group(1).split(",") if e.strip()]
+        elif pd:
+            kind = (pd.group(2) or "").lower() or None
+            if kind and kind not in PARAM_TYPES:
+                bad_decls.append(f"unknown parameter type '{pd.group(2)}' (use json or text): {body}")
+                kind = None
+            param_decls[pd.group(1)] = {"type": kind, "doc": (pd.group(3) or "").strip() or None}
+        elif cd:
+            column_docs[cd.group(1)] = (cd.group(2) or "").strip() or None
+        elif re.match(r"(param|column)\b", body, re.I):
+            bad_decls.append(f"malformed header line: {body}")
+            notes.append(body)
         elif desc is None and body:
             desc = body
         elif body:
@@ -196,10 +257,11 @@ def parse_query(path):
             if p not in params:
                 params.append(p)
     return {"sql": sql, "statements": stmts, "code": code, "description": desc, "exports": exports,
-            "mode": mode or inferred, "declaredMode": mode, "inferredMode": inferred, "params": params, "notes": notes}
+            "mode": mode or inferred, "declaredMode": mode, "inferredMode": inferred, "params": params, "notes": notes,
+            "param_decls": param_decls, "column_docs": column_docs, "bad_decls": bad_decls}
 
 
-def run_export(root, db, name, params):
+def run_export(root, db, name, params, raw=None):
     """Run db/exports/<name>.sql (a single read statement returning path + content columns) and write each row to
     <root>/<path>. Paths must stay inside the project root. Writes are atomic and skipped when content is unchanged.
     Only the parameters the export itself references are bound (a subset of the triggering query's params)."""
@@ -214,8 +276,9 @@ def run_export(root, db, name, params):
     missing = [p for p in q["params"] if p not in params]
     if missing:
         raise ValueError(f"export {name} needs parameters {missing}")
+    bound = bind_values(q, {p: params[p] for p in q["params"]}, raw)
     con = connect(db_path(root, db), True)
-    rows = [dict(r) for r in con.execute(q["statements"][0], {p: params[p] for p in q["params"]})]
+    rows = [dict(r) for r in con.execute(q["statements"][0], bound)]
     root_abs = os.path.realpath(root)
     written, unchanged = [], []
     for r in rows:
@@ -241,8 +304,9 @@ def run_export(root, db, name, params):
 
 def cmd_export(args, root):
     try:
-        params = collect_params(args)
-        emit({"ok": True, **run_export(root, args.db, args.name, params)})
+        raw = {}
+        params = collect_params(args, raw)
+        emit({"ok": True, **run_export(root, args.db, args.name, params, raw)})
     except (sqlite3.Error, ValueError, OSError) as e:
         fail(args.name, str(e))
 
@@ -284,7 +348,10 @@ def cmd_list(args, root):
     for fn in sorted(os.listdir(qdir)) if os.path.isdir(qdir) else []:
         if fn.endswith(".sql"):
             q = parse_query(os.path.join(qdir, fn))
-            items.append({"name": fn[:-4], "mode": q["mode"], "params": q["params"], "exports": q["exports"], "description": q["description"]})
+            item = {"name": fn[:-4], "mode": q["mode"], "params": param_info(q), "exports": q["exports"], "description": q["description"]}
+            if q["column_docs"]:
+                item["columns"] = q["column_docs"]
+            items.append(item)
     emit({"ok": True, "root": root, "queries": items})
 
 
@@ -299,7 +366,8 @@ def cmd_run(args, root):
     if q["declaredMode"] == "read" and q["inferredMode"] == "write":
         fail(name, "query declares mode: read but contains write statements")
     try:
-        params = collect_params(args)
+        raw = {}
+        params = collect_params(args, raw)
     except (ValueError, OSError) as e:
         fail(name, f"invalid params: {e}")
     missing = [p for p in q["params"] if p not in params]
@@ -307,10 +375,14 @@ def cmd_run(args, root):
     if missing or extra:
         # The definition is already loaded, so hand back what the query is and what its parameters mean
         # (usually written in the header comments) and save the caller a round trip.
-        about = {"description": q["description"]}
+        about = {"description": q["description"], "params": param_info(q)}
         if q["notes"]:
             about["notes"] = q["notes"]
         fail(name, "parameter mismatch", missing=missing, unexpected=extra, expected=q["params"], **about, hint=LIST_HINT)
+    try:
+        bound = bind_values(q, params, raw)
+    except ValueError as e:
+        fail(name, str(e), params=param_info(q))
     read_only = q["mode"] == "read"
     if read_only and len(q["statements"]) != 1:
         fail(name, "a read query must contain exactly one statement")
@@ -320,17 +392,20 @@ def cmd_run(args, root):
         fail(name, str(e))
     try:
         if read_only:
-            cur = con.execute(q["statements"][0], {p: params[p] for p in q["params"]})
+            cur = con.execute(q["statements"][0], {p: bound[p] for p in q["params"]})
             rows = cur.fetchmany(args.max_rows + 1)
             truncated = len(rows) > args.max_rows
             out = [dict(r) for r in rows[:args.max_rows]]
             if args.raw:
                 emit_raw(name, [dict(r) for r in rows], args.raw)
-            emit({"ok": True, "query": name, "mode": "read", "rows": out, "row_count": len(out), "truncated": truncated})
+            res = {"ok": True, "query": name, "mode": "read", "rows": out, "row_count": len(out), "truncated": truncated}
+            if q["column_docs"]:
+                res["columns"] = q["column_docs"]
+            emit(res)
         con.execute("BEGIN IMMEDIATE")
         affected, returned = 0, []
         for stmt, code in zip(q["statements"], q["code"]):
-            own = {p: params[p] for p in PARAM.findall(code)}
+            own = {p: bound[p] for p in PARAM.findall(code)}
             cur = con.execute(stmt, own)
             if cur.description:
                 returned.extend(dict(r) for r in cur.fetchall())
@@ -341,9 +416,11 @@ def cmd_run(args, root):
         if returned:
             res["rows"] = returned[:args.max_rows]
             res["row_count"] = len(res["rows"])
+            if q["column_docs"]:
+                res["columns"] = q["column_docs"]
         if q["exports"]:
             try:
-                res["exports"] = [run_export(root, args.db, ex, params) for ex in q["exports"]]
+                res["exports"] = [run_export(root, args.db, ex, bound, raw) for ex in q["exports"]]
             except (sqlite3.Error, ValueError, OSError) as e:
                 res["ok"] = False
                 res["error"] = f"write committed but export failed: {e}"
@@ -528,6 +605,32 @@ def cmd_check(args, root):
             except sqlite3.Error as e:
                 problems.append(f"{label}: {e}")
 
+    def docs_ok(label, q):
+        """Documented parameters and columns must exist, or the docs silently go stale."""
+        for bad in q["bad_decls"]:
+            problems.append(f"{label}: {bad}")
+        for p in q["param_decls"]:
+            if p not in q["params"]:
+                problems.append(f"{label}: '-- param {p}' documents a parameter the query does not take")
+        if not q["column_docs"]:
+            return
+        if q["inferredMode"] != "read" or len(q["statements"]) != 1:
+            notes.append(f"{label}: column docs are not verified for write queries")
+            return
+        if con is None or pending:
+            return
+        # Ask SQLite for the result's column names without producing rows.
+        st = re.sub(r";\s*(--[^\n]*)?\s*$", "", q["statements"][0].strip())
+        try:
+            cur = con.execute(f"SELECT * FROM (\n{st}\n) LIMIT 0", {p: None for p in q["params"]})
+            names = [d[0] for d in cur.description]
+        except sqlite3.Error as e:
+            notes.append(f"{label}: could not read result columns to verify column docs ({e})")
+            return
+        for c in q["column_docs"]:
+            if c not in names:
+                problems.append(f"{label}: '-- column {c}' documents a column the result does not have (has {names})")
+
     exports = {}
     edir = os.path.join(root, "db", "exports")
     for fn in sorted(os.listdir(edir)) if os.path.isdir(edir) else []:
@@ -537,6 +640,7 @@ def cmd_check(args, root):
             if q["inferredMode"] != "read" or len(q["statements"]) != 1:
                 problems.append(f"export {fn[:-4]}: must be exactly one read statement")
             compile_ok(f"export {fn[:-4]}", q["statements"], q["params"])
+            docs_ok(f"export {fn[:-4]}", q)
     qdir = os.path.join(root, "db", "queries")
     count = 0
     for fn in sorted(os.listdir(qdir)) if os.path.isdir(qdir) else []:
@@ -563,6 +667,7 @@ def cmd_check(args, root):
                 if extra:
                     problems.append(f"query {name}: export {ex} needs parameters the query does not take: {extra}")
         compile_ok(f"query {name}", q["statements"], q["params"])
+        docs_ok(f"query {name}", q)
     emit({"ok": not problems, "root": root, "queries": count, "exports": len(exports), "migrations": len(files),
           "problems": problems, "notes": notes}, 0 if not problems else 1)
 
