@@ -817,8 +817,21 @@ def cmd_check(args, root):
           "problems": problems, "notes": notes}, 0 if not problems else 1)
 
 
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Argument mistakes come back as one JSON object too (callers are agents), with that command's usage and
+    options, so the right arguments are known at the moment of the mistake. Subcommand parsers inherit this."""
+
+    def error(self, message):
+        # A command's own help lists its options; the top-level help is the long module docstring, so give only its
+        # short usage (which names the commands) there.
+        usage = self.format_usage() if self.description else self.format_help()
+        print(json.dumps({"ok": False, "query": None, "error": f"invalid arguments: {message}",
+                          "usage": usage.strip()}, ensure_ascii=False))
+        sys.exit(2)
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = JsonArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", help="project root (default: nearest ancestor containing db/queries or db/migrations)")
     ap.add_argument("--db", help="database path (default: <root>/db/project.db, or an existing <root>/project.db)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -852,7 +865,9 @@ def main():
     x.add_argument("--params-file", help="file containing the JSON params object")
     x.add_argument("--param", action="append", metavar="KEY=VALUE")
     x.add_argument("--param-file", action="append", metavar="KEY=PATH")
-    args = ap.parse_args()
+    args, extra = ap.parse_known_args()
+    if extra:  # report unknown arguments against the command they were given to, with that command's options
+        sub.choices[args.cmd].error(f"unrecognized arguments: {' '.join(extra)}")
     root = find_root(args.root)
     started = time.perf_counter()
     try:
