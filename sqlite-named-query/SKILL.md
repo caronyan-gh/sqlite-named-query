@@ -83,7 +83,10 @@ python $NQ run close_test --params '{"test_id":"T-A-001","result":"passed"}'
 python $NQ export test_summary      # run a projection by hand
 python $NQ check                    # lint db/ (executes and writes nothing)
 python $NQ backup --label task-090  # copy the database to db/backup/project-task-090-<date-time>.db
+python $NQ stats                    # timing log: slowest queries and searches that found nothing
 ```
+
+Every `run` and `list <word>` is timed and logged quietly to `db/stats/nq-stats.db` (a separate, git-ignored file; the last 30 days are kept). You do not need to look at it during normal work. When something feels slow, or a search keeps finding nothing, check `nq.py stats` (narrow it with `--table`, `--query`, or `--recent N`) instead of guessing.
 
 `backup` copies the database with SQLite's online backup API, so it is safe while the database is in use (WAL included). Backups go to `db/backup/project-<label>-<YYYYMMDD-HHMMSS>.db` (just `project-<YYYYMMDD-HHMMSS>.db` without `--label`; the date-time means the same label never overwrites an earlier backup), only the newest `--keep` (default 7) are kept — "newest" is read from the date-time in the file name, not the file's modified time, which copying or unzipping can reset — and `db/backup/` gets its own `.gitignore` so backups never end up in git. The command only backs up when called; when to call it (every tenth task, before a risky migration, ...) is the project's decision, typically made in one of its own scripts. A failed backup returns `ok: false` and changes nothing, so the caller can warn and carry on.
 

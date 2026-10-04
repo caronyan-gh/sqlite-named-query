@@ -24,6 +24,12 @@ Commands
     backup [--label L] [--keep N]  copy the database to <root>/db/backup/project-<L>-<date-time>.db with SQLite's online
                                  backup API (safe while in use / WAL); keeps the newest N backups (default 7).
                                  When to back up is the project's decision: call this from its own scripts
+    stats [--days N] [--top N] [--query RE] [--table T] [--recent N]
+                                 slowest queries (runs, avg/max ms, errors) and searches that found nothing, from the
+                                 timing log; --query / --table narrow it to matching query names / queries using a
+                                 table, --recent N lists the latest runs one by one. Every `run` and `list <word>` is quietly logged to
+                                 <root>/db/stats/nq-stats.db (separate file, git-ignored, last NQ_STATS_DAYS=30 days
+                                 kept; NQ_STATS=0 turns logging off). Logging never changes a command's output
 
 Text projection: a write query may declare "-- export: a, b". After COMMIT the runner runs db/exports/a.sql and
 b.sql (single read statements returning columns path and content) with the subset of parameters they reference,
@@ -151,12 +157,119 @@ def emit_raw(query, rows, column):
     sys.stdout.flush()
     sys.stdout.buffer.write(("" if value is None else str(value)).encode("utf-8"))
     sys.stdout.buffer.flush()
+    LAST_RESULT.clear()
+    LAST_RESULT.update({"ok": True, "query": query, "row_count": 1})
     sys.exit(0)
+
+
+LAST_RESULT = {}  # what was printed last; read by record_stats after the command finishes
 
 
 def emit(obj, code=0):
     print(json.dumps(obj, ensure_ascii=False, default=str))
+    LAST_RESULT.clear()
+    LAST_RESULT.update(obj)
     sys.exit(code)
+
+
+def stats_path(root):
+    return os.path.join(root, "db", "stats", "nq-stats.db")
+
+
+def stats_days():
+    try:
+        return max(1, int(os.environ.get("NQ_STATS_DAYS", "30")))
+    except ValueError:
+        return 30
+
+
+def record_stats(root, args, seconds):
+    """Quietly log how long each `run` took (and what `list <word>` searched for) to <root>/db/stats/nq-stats.db,
+    a separate file so read queries keep the project database read-only. Rows older than NQ_STATS_DAYS (default 30)
+    are pruned every 100 records. Never affects the command's output or exit code; NQ_STATS=0 turns it off."""
+    if os.environ.get("NQ_STATS", "1").lower() in ("0", "off", "false", "no"):
+        return
+    words = getattr(args, "keyword", None)
+    if args.cmd != "run" and not (args.cmd == "list" and words):
+        return
+    try:
+        path = stats_path(root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ignore = os.path.join(os.path.dirname(path), ".gitignore")
+        if not os.path.exists(ignore):
+            with open(ignore, "w", encoding="utf-8") as fh:
+                fh.write("# created by nq.py: query timing log, local only\n*\n")
+        con = sqlite3.connect(path, timeout=1.0, isolation_level=None)
+        try:
+            con.execute("CREATE TABLE IF NOT EXISTS runs (at TEXT NOT NULL, query TEXT, mode TEXT, ms REAL, "
+                        "rows INTEGER, ok INTEGER, error TEXT)")
+            con.execute("CREATE TABLE IF NOT EXISTS searches (at TEXT NOT NULL, keyword TEXT, hits INTEGER, ms REAL)")
+            con.execute("CREATE INDEX IF NOT EXISTS runs_at ON runs(at)")
+            con.execute("CREATE INDEX IF NOT EXISTS searches_at ON searches(at)")
+            now = "datetime('now', 'localtime')"
+            ms = round(seconds * 1000, 1)
+            r = LAST_RESULT
+            if args.cmd == "run":
+                cur = con.execute(f"INSERT INTO runs VALUES ({now}, ?, ?, ?, ?, ?, ?)",
+                                  (args.name, r.get("mode"), ms, r.get("row_count"), 1 if r.get("ok") else 0,
+                                   (str(r["error"])[:200] if r.get("error") else None)))
+                table = "runs"
+            else:
+                hits = 0 if r.get("match") == 0 else len(r.get("queries") or [])
+                cur = con.execute(f"INSERT INTO searches VALUES ({now}, ?, ?, ?)", (" ".join(words), hits, ms))
+                table = "searches"
+            if cur.lastrowid and cur.lastrowid % 100 == 0:
+                con.execute(f"DELETE FROM {table} WHERE at < datetime('now', 'localtime', ?)", (f"-{stats_days()} days",))
+        finally:
+            con.close()
+    except Exception:
+        pass  # timing is a nice-to-have; never let it break or slow a query result
+
+
+def query_uses_table(root, name, table):
+    """True when db/queries/<name>.sql mentions `table` as a word in its SQL (comments and strings ignored)."""
+    path = os.path.join(root, "db", "queries", name + ".sql")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", name or "") or not os.path.isfile(path):
+        return False
+    code = " ".join(parse_query(path)["code"])
+    return re.search(rf"(?<![\w.]){re.escape(table)}(?!\w)", code, re.I) is not None
+
+
+def cmd_stats(args, root):
+    """Slowest queries and fruitless searches from the timing log (see record_stats), or the latest runs one by one
+    (--recent N). --query (regex on the query name) and --table (queries whose SQL uses that table) narrow both."""
+    filters = {k: v for k, v in (("query", args.query), ("table", args.table)) if v}
+    path = stats_path(root)
+    if not os.path.exists(path):
+        emit({"ok": True, "days": args.days, **({"filters": filters} if filters else {}), "queries": [],
+              "no_match_searches": [], "note": "no timing log yet"})
+    con = sqlite3.connect(ro_uri(path), uri=True, timeout=5.0)
+    since = f"-{args.days} days"
+    names = [n for (n,) in con.execute("SELECT DISTINCT query FROM runs WHERE at >= datetime('now', 'localtime', ?)", (since,))]
+    if args.query:
+        try:
+            pat = re.compile(args.query, re.I)
+        except re.error:
+            pat = re.compile(re.escape(args.query), re.I)
+        names = [n for n in names if n and pat.search(n)]
+    if args.table:
+        names = [n for n in names if query_uses_table(root, n, args.table)]
+    marks = ",".join("?" * len(names)) or "NULL"
+    out = {"ok": True, "days": args.days, **({"filters": filters} if filters else {})}
+    if args.recent:
+        out["runs"] = [dict(zip(("at", "query", "mode", "ms", "rows", "ok", "error"), row)) for row in con.execute(
+            f"SELECT at, query, mode, ms, rows, ok, error FROM runs WHERE at >= datetime('now', 'localtime', ?) "
+            f"AND query IN ({marks}) ORDER BY rowid DESC LIMIT ?", (since, *names, args.recent))]
+        emit(out)
+    out["queries"] = [dict(zip(("query", "runs", "avg_ms", "max_ms", "errors", "last_at"), row)) for row in con.execute(
+        f"SELECT query, count(*), round(avg(ms), 1), round(max(ms), 1), sum(ok = 0), max(at) FROM runs "
+        f"WHERE at >= datetime('now', 'localtime', ?) AND query IN ({marks}) GROUP BY query ORDER BY max(ms) DESC LIMIT ?",
+        (since, *names, args.top))]
+    if not filters:
+        out["no_match_searches"] = [dict(zip(("keyword", "times", "last_at"), row)) for row in con.execute(
+            "SELECT keyword, count(*), max(at) FROM searches WHERE hits = 0 AND at >= datetime('now', 'localtime', ?) "
+            "GROUP BY keyword ORDER BY count(*) DESC, max(at) DESC LIMIT ?", (since, args.top))]
+    emit(out)
 
 
 def fail(query, msg, **extra):
@@ -727,6 +840,12 @@ def main():
     b = sub.add_parser("backup")
     b.add_argument("--label", help="name part before the date-time, e.g. task-090 (optional)")
     b.add_argument("--keep", type=int, default=7, help="number of backups to keep (default 7)")
+    st = sub.add_parser("stats")
+    st.add_argument("--days", type=int, default=30, help="look back this many days (default 30)")
+    st.add_argument("--top", type=int, default=20, help="rows per list (default 20)")
+    st.add_argument("--query", help="only queries whose name matches this (case-insensitive regex, e.g. '^task_')")
+    st.add_argument("--table", help="only queries whose SQL uses this table")
+    st.add_argument("--recent", type=int, default=0, metavar="N", help="show the latest N runs one by one instead of totals")
     x = sub.add_parser("export")
     x.add_argument("name")
     x.add_argument("--params", help="JSON object of named parameters")
@@ -735,11 +854,17 @@ def main():
     x.add_argument("--param-file", action="append", metavar="KEY=PATH")
     args = ap.parse_args()
     root = find_root(args.root)
+    started = time.perf_counter()
     try:
-        {"list": cmd_list, "run": cmd_run, "migrate": cmd_migrate, "status": cmd_status, "export": cmd_export, "check": cmd_check,
-         "backup": cmd_backup}[args.cmd](args, root)
-    except Exception as e:  # keep the "always one JSON object" contract
-        fail(getattr(args, "name", None), f"{type(e).__name__}: {e}")
+        try:
+            {"list": cmd_list, "run": cmd_run, "migrate": cmd_migrate, "status": cmd_status, "export": cmd_export,
+             "check": cmd_check, "backup": cmd_backup, "stats": cmd_stats}[args.cmd](args, root)
+        except SystemExit:
+            raise
+        except Exception as e:  # keep the "always one JSON object" contract
+            fail(getattr(args, "name", None), f"{type(e).__name__}: {e}")
+    finally:
+        record_stats(root, args, time.perf_counter() - started)
 
 
 if __name__ == "__main__":
