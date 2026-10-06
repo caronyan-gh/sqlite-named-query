@@ -83,13 +83,23 @@ See [`sqlite-named-query/SKILL.md`](sqlite-named-query/SKILL.md) for the full re
 ## Repository layout
 
 ```
-sqlite-named-query/
+sqlite-named-query/          the skill (copy this folder)
 ├─ SKILL.md                  skill definition and reference
 ├─ scripts/nq.py             the runner
 └─ references/
    ├─ lessons.md             lessons from real use (read when designing a database or when stuck)
    └─ example/db/            example migrations, queries and exports
+tests/test_nq.py             tests for nq.py (not needed to use the skill)
+CHANGELOG.md                 what changed in each version (`nq.py --version`)
 ```
+
+## Tests
+
+```bash
+python -m unittest discover tests
+```
+
+Standard library only. Each test copies the example project into a temporary folder and drives `nq.py` the way an agent does.
 
 ## What it ended up doing in my project (nobody planned these)
 

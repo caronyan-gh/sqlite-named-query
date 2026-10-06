@@ -48,7 +48,10 @@ Header comments at the top of a query file (optional):
 
 Output is always one JSON object on stdout. Standard library only.
 """
+__version__ = "0.1.0"  # see CHANGELOG.md in the repository
+
 import argparse
+import difflib
 import io
 import json
 import os
@@ -500,13 +503,26 @@ def cmd_list(args, root):
           "queries": [{"name": i["name"], "description": i["description"]} for i, _ in items]})
 
 
+def similar_queries(root, name):
+    """Up to three existing query names close to a mistyped one (most failed runs in real use were guessed names),
+    as {"did_you_mean": [...]}; empty when nothing is close."""
+    qdir = os.path.join(root, "db", "queries")
+    names = [f[:-4] for f in os.listdir(qdir) if f.endswith(".sql")] if os.path.isdir(qdir) else []
+    lowered = {n.lower(): n for n in names}
+    close = [lowered[m] for m in difflib.get_close_matches(name.lower(), list(lowered), n=3, cutoff=0.6)]
+    for n in names:  # also offer names that contain every part of the guess (task_get -> task_get_full)
+        if len(close) < 3 and n not in close and all(part in n.lower() for part in name.lower().split("_") if part):
+            close.append(n)
+    return {"did_you_mean": close} if close else {}
+
+
 def cmd_run(args, root):
     name = args.name
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", name):
         fail(name, "invalid query name")
     path = os.path.join(root, "db", "queries", name + ".sql")
     if not os.path.isfile(path):
-        fail(name, f"unknown query: {name}", hint=LIST_HINT)
+        fail(name, f"unknown query: {name}", **similar_queries(root, name), hint=LIST_HINT)
     q = parse_query(path)
     if q["declaredMode"] == "read" and q["inferredMode"] == "write":
         fail(name, "query declares mode: read but contains write statements")
@@ -710,7 +726,7 @@ def cmd_status(args, root):
         if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_nq_migrations'").fetchone():
             done = {r[0] for r in con.execute("SELECT name FROM _nq_migrations")}
     emit({"ok": True, "root": root, "db": path, "exists": os.path.exists(path),
-          "applied": sorted(done), "pending": [f for f in files if f not in done]})
+          "applied": sorted(done), "pending": [f for f in files if f not in done], "version": __version__})
 
 
 def cmd_check(args, root):
@@ -832,6 +848,7 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 def main():
     ap = JsonArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"nq.py {__version__}")
     ap.add_argument("--root", help="project root (default: nearest ancestor containing db/queries or db/migrations)")
     ap.add_argument("--db", help="database path (default: <root>/db/project.db, or an existing <root>/project.db)")
     sub = ap.add_subparsers(dest="cmd", required=True)
