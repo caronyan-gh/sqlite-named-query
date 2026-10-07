@@ -2,6 +2,17 @@
 
 `nq.py --version` and `nq.py status` report the version.
 
+## Unreleased
+
+Documentation and examples only; `nq.py` and its output are unchanged.
+
+### Added
+- Examples: `002_add_status_check.sql` (rebuilding a table to add a CHECK constraint with `-- nq: foreign_keys=off`), `add_tests.sql` (a `json` parameter), `test_history.sql` (documented parameter and columns). Tests cover them.
+- README states the SQLite requirement: 3.35 or newer (`RETURNING` in the examples).
+
+### Changed
+- SKILL.md keeps what is needed every time; task-specific details (exports, rebuilding tables, what `check` verifies, backups, the timing log, concurrency, the legacy database location) moved to `references/reference.md`, with short "read this first" pointers left in SKILL.md.
+
 ## 0.1.0 — 2026-10-07
 
 First tagged release. Everything below was already on `main` before the tag.

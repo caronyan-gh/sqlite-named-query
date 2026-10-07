@@ -61,7 +61,7 @@ git clone https://github.com/caronyan-gh/sqlite-named-query.git
 cp -r sqlite-named-query/sqlite-named-query <your-skills-dir>/
 ```
 
-Requires Python 3.8+.
+Requires Python 3.8+ whose `sqlite3` module uses SQLite 3.35 or newer (for `RETURNING`, used by the examples). Check with `python -c "import sqlite3; print(sqlite3.sqlite_version)"`.
 
 ## Try it by hand
 
@@ -78,17 +78,18 @@ python $NQ run close_test --params '{"test_id":"T-A-001","result":"passed"}'
 cat reports/tests/SUMMARY.md
 ```
 
-See [`sqlite-named-query/SKILL.md`](sqlite-named-query/SKILL.md) for the full reference: project layout, query file headers, projections, migrations, `check`, and operating rules. Lessons from real use are in [`references/lessons.md`](sqlite-named-query/references/lessons.md).
+See [`sqlite-named-query/SKILL.md`](sqlite-named-query/SKILL.md) for how to use it: project layout, commands, query file headers, and operating rules. Task-specific details (exports, rebuilding tables, what `check` verifies, backups, the timing log) are in [`references/reference.md`](sqlite-named-query/references/reference.md), and lessons from real use in [`references/lessons.md`](sqlite-named-query/references/lessons.md).
 
 ## Repository layout
 
 ```
 sqlite-named-query/          the skill (copy this folder)
-├─ SKILL.md                  skill definition and reference
+├─ SKILL.md                  skill definition: what you need every time
 ├─ scripts/nq.py             the runner
 └─ references/
+   ├─ reference.md           task-specific details (exports, table rebuilds, check, backups, timing log)
    ├─ lessons.md             lessons from real use (read when designing a database or when stuck)
-   └─ example/db/            example migrations, queries and exports
+   └─ example/db/            example migrations (incl. a table rebuild), queries (json params, column docs) and exports
 tests/test_nq.py             tests for nq.py (not needed to use the skill)
 CHANGELOG.md                 what changed in each version (`nq.py --version`)
 ```

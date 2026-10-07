@@ -61,11 +61,9 @@ Run `check` yourself after every change to queries, exports or migrations.
    └─ exports/<name>.sql       text projections (read queries returning path and content columns)
 ```
 
-`<root>` is found automatically as the nearest ancestor directory that contains `db/queries` or `db/migrations` (or pass `--root`).
+`<root>` is found automatically as the nearest ancestor directory that contains `db/queries` or `db/migrations` (or pass `--root`). An older project with `<root>/project.db` still works (see `references/reference.md`).
 
-Older projects that keep the database at `<root>/project.db` keep working: if `db/project.db` does not exist and `<root>/project.db` does, that one is used. To move it, stop anything using the database and move `project.db` together with its `-wal` and `-shm` files into `db/`.
-
-A working example is in `references/example/`.
+A working example is in `references/example/`: a migration that rebuilds a table to add a CHECK constraint, a write query with a `json` parameter (`add_tests`), a read query with documented columns (`test_history`), and a write query that refreshes exports (`close_test`).
 
 ## Usage
 
@@ -86,9 +84,7 @@ python $NQ backup --label task-090  # copy the database to db/backup/project-tas
 python $NQ stats                    # timing log: slowest queries and searches that found nothing
 ```
 
-Every `run` and `list <word>` is timed and logged quietly to `db/stats/nq-stats.db` (a separate, git-ignored file; the last 30 days are kept). Logging is on by default. Set `NQ_STATS=0` for calls that should not be counted — for example a dashboard that refreshes every few seconds — or to turn it off entirely. You do not need to look at it during normal work. When something feels slow, or a search keeps finding nothing, check `nq.py stats` (narrow it with `--table`, `--query`, or `--recent N`) instead of guessing.
-
-`backup` copies the database with SQLite's online backup API, so it is safe while the database is in use (WAL included). Backups go to `db/backup/project-<label>-<YYYYMMDD-HHMMSS>.db` (just `project-<YYYYMMDD-HHMMSS>.db` without `--label`; the date-time means the same label never overwrites an earlier backup), only the newest `--keep` (default 7) are kept — "newest" is read from the date-time in the file name, not the file's modified time, which copying or unzipping can reset — and `db/backup/` gets its own `.gitignore` so backups never end up in git. The command only backs up when called; when to call it (every tenth task, before a risky migration, ...) is the project's decision, typically made in one of its own scripts. A failed backup returns `ok: false` and changes nothing, so the caller can warn and carry on.
+Every option of a command is in `nq.py <command> --help`; a wrong option also returns that command's usage as JSON.
 
 Parameters can be passed three ways, and the ways can be combined (passing the same key twice is an error).
 
@@ -109,7 +105,7 @@ python $NQ run task_get --param task_id=31 --raw instruction_md                 
 
 Read results are capped at 200 rows by default (`--max-rows`). Beyond that, `truncated: true` is set.
 
-Caution: even when `--db` points at another database, exports are still written into the project directory. Trying write queries against a scratch database will overwrite the real exported files.
+Every `run` and `list <word>` is timed and logged to `db/stats/nq-stats.db`; it is on by default, and `NQ_STATS=0` keeps a call out of it (for example a dashboard that refreshes every few seconds). Details on backups and the timing log are in `references/reference.md`.
 
 ## Writing a query file
 
@@ -139,50 +135,9 @@ Document parameters and result columns in the header, so callers never need to o
 - **read**: exactly one statement. The database is opened read-only, so writes are physically impossible. Declaring `mode: read` on a query that contains a write statement is an error.
 - **write**: may contain several statements. They run in a single transaction (`BEGIN IMMEDIATE`); if any fails, everything is rolled back. Rows from `RETURNING` go into `rows`.
 
-## Text projections
+**Exports** (`db/exports/<name>.sql`) are single read statements returning `path` and `content` columns; a write query lists them in `-- export:` and they run after its COMMIT, writing each row's `content` to `<root>/<path>`. See `references/reference.md` before writing one.
 
-`db/exports/<name>.sql` is a single read statement returning `path` and `content` columns. For each row, `content` is written to `<root>/<path>`.
-
-```sql
--- One markdown card per test
-SELECT 'reports/tests/' || test_id || '.md' AS path,
-       '# ' || test_id || char(10) || 'status: ' || status || char(10) AS content
-FROM tests WHERE test_id = :test_id;
-```
-
-- Exports listed in a write query's `-- export:` header run automatically after a successful COMMIT. Each export receives only the parameters it references, taken from the write query's parameters.
-- Paths outside the project directory are rejected (`../` and the like).
-- Files are replaced via a temporary file. If the content is identical, the file is left untouched (listed under `unchanged`).
-- If the write succeeded but an export failed, the result is `ok: false` with `write committed but export failed`. The data is already committed; fix the cause and re-run with `export`.
-
-## Rebuilding a table (migrations)
-
-In SQLite, changing a column constraint (such as CHECK) requires rebuilding the table. That fails while foreign-key enforcement is on, so put this line at the top of the migration:
-
-```sql
--- nq: foreign_keys=off
-```
-
-Foreign keys are then disabled for that migration only, and `PRAGMA foreign_key_check` must come back empty before COMMIT (any violation rolls everything back). Enforcement is restored afterwards. The rebuild procedure is: create the new table → copy the rows → drop the old table → rename the new table.
-
-Do not put `BEGIN` / `COMMIT` in migration files; the runner wraps each migration in its own transaction.
-
-## Checking (`check`)
-
-`check` verifies the following and lists issues under `problems` (any issue means `ok: false` and exit code 1). Run it whenever you add queries or schema.
-
-- Applied migration files have not been modified since they were applied (compared with the SHA-256 recorded at `migrate` time; line-ending differences are ignored)
-- Read queries contain exactly one statement, and queries declared `mode: read` contain no write statements
-- Exports named in `-- export:` exist, and they do not use parameters the triggering query does not take
-- Every statement compiles against the current database (via `EXPLAIN`; nothing is executed). Skipped while migrations are pending
-
-Migrations applied before checksums were introduced are recorded from the current file contents on the next `migrate` (`checksumsAdopted`).
-
-## Concurrency
-
-- Write connections use WAL mode, so they do not block readers.
-- `busy_timeout` is 5 seconds. Several agents writing at the same time wait for each other instead of failing.
-- Foreign keys are enforced (`PRAGMA foreign_keys=ON`).
+**Migrations**: never put `BEGIN` / `COMMIT` in a migration file (each migration already runs in its own transaction). Changing a column constraint means rebuilding the table, with `-- nq: foreign_keys=off` at the top of the migration — see `references/reference.md` before writing one.
 
 ## Operating rules
 
@@ -194,6 +149,7 @@ Migrations applied before checksums were introduced are recorded from the curren
 6. `project.db` is binary and does not diff. If you use git, track the exported text instead.
 7. When you report numbers, quote values from a query you just ran. Do not mix in values you remember from earlier in the conversation — say where each number came from.
 
-## Lessons from real use
+## More
 
-Lessons from running this skill with several agents on a real project are in `references/lessons.md` (next to this file): how to shape the schema, early mistakes, capturing time, and tips such as generating handoff notes and moving text into the database. Read it when you start designing a project's database, and when something in daily use goes wrong or feels awkward.
+- `references/reference.md`: exports, rebuilding tables, what `check` verifies, backups, the timing log, concurrency. Read the section before doing that task.
+- `references/lessons.md`: lessons from running this skill with several agents on a real project — how to shape the schema, early mistakes, capturing time, and tips such as generating handoff notes and moving text into the database. Read it when you start designing a project's database, and when something in daily use goes wrong or feels awkward.

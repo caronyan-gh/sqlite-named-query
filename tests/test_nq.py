@@ -57,7 +57,7 @@ class Basics(Project):
     def test_migrate_and_status(self):
         code, out = self.nq("status")
         self.assertFalse(out["exists"])
-        self.assertEqual(out["pending"], ["001_init.sql"])
+        self.assertEqual(out["pending"], ["001_init.sql", "002_add_status_check.sql"])
         self.assertFalse(os.path.exists(os.path.join(self.root, "db", "project.db")), "status must not create the db")
         self.migrate()
         code, out = self.nq("status")
@@ -161,6 +161,29 @@ class Parameters(Project):
         self.assertEqual(out["columns"], {"title": "short title"})
 
 
+class Example(Project):
+    """The shipped example itself: a constraint added by rebuilding, a json parameter, documented columns."""
+
+    def test_status_check_from_rebuild_migration(self):
+        self.migrate()
+        con = self.db()
+        with self.assertRaises(sqlite3.IntegrityError):
+            con.execute("UPDATE tests SET status = 'bogus'")
+
+    def test_add_tests_takes_an_array(self):
+        self.migrate()
+        code, out = self.nq("run", "add_tests", "--params",
+                            '{"items": [{"test_id": "T-B-001", "title": "beta"}, {"test_id": "T-A-001", "title": "dup"}]}')
+        self.assertEqual((code, out["rows"]), (0, [{"test_id": "T-B-001"}]), out)
+
+    def test_history_documents_its_columns(self):
+        self.migrate()
+        self.nq("run", "close_test", "--param", "test_id=T-A-001", "--param", "result=passed")
+        code, out = self.nq("run", "test_history", "--param", "test_id=null")
+        self.assertEqual([(r["test_id"], r["runs"]) for r in out["rows"]], [("T-A-001", 1), ("T-A-002", 0)])
+        self.assertIn("never run", out["columns"]["last_run"])
+
+
 class Listing(Project):
     def test_search_and_no_match(self):
         self.migrate()
@@ -168,7 +191,7 @@ class Listing(Project):
         self.assertEqual([q["name"] for q in out["queries"]], ["close_test"])
         code, out = self.nq("list", "zzzz")
         self.assertEqual(out["match"], 0)
-        self.assertEqual({q["name"] for q in out["queries"]}, {"close_test", "get_open_test"})
+        self.assertEqual({q["name"] for q in out["queries"]}, {"add_tests", "close_test", "get_open_test", "test_history"})
         self.assertEqual(set(out["queries"][0]), {"name", "description"})
 
     def test_params_are_objects(self):
@@ -216,15 +239,15 @@ class Checks(Project):
                    "CHECK (status IN ('open', 'passed')), last_result TEXT, updated_at TEXT);\n"
                    "INSERT INTO tests_new SELECT * FROM tests;\nDROP TABLE tests;\n"
                    "ALTER TABLE tests_new RENAME TO tests;\n")
-        self.write("db/migrations/002_rebuild.sql", rebuild)
+        self.write("db/migrations/003_rebuild.sql", rebuild)
         code, out = self.nq("migrate")
-        self.assertEqual((code, out["applied"]), (0, ["002_rebuild.sql"]), out)
-        self.write("db/migrations/003_broken.sql", "-- nq: foreign_keys=off\nINSERT INTO test_runs(test_id, result) VALUES ('NOPE', 'x');\n")
+        self.assertEqual((code, out["applied"]), (0, ["003_rebuild.sql"]), out)
+        self.write("db/migrations/004_broken.sql", "-- nq: foreign_keys=off\nINSERT INTO test_runs(test_id, result) VALUES ('NOPE', 'x');\n")
         code, out = self.nq("migrate")
         self.assertEqual(code, 1)
         self.assertIn("foreign_key_check failed", out["error"])
         code, out = self.nq("status")
-        self.assertEqual(out["pending"], ["003_broken.sql"])
+        self.assertEqual(out["pending"], ["004_broken.sql"])
 
 
 class Storage(Project):
