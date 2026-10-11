@@ -4,9 +4,11 @@
 
 ## Unreleased
 
-Documentation and examples only; `nq.py` and its output are unchanged.
+Output of existing commands is unchanged; the one behavior change is that a wrong `--root` is now an error.
 
 ### Added
+- A `--root` that has neither `db/queries` nor `db/migrations` stops before anything is read or created, with a hint (for example "this looks like the db/ folder itself; pass its parent"). It used to be accepted silently, so `migrate`/`check` ran against an empty project.
+- SKILL.md: values with non-ASCII text, line breaks, or quotes go through `--param-file` / `--params-file`.
 - Examples: `002_add_status_check.sql` (rebuilding a table to add a CHECK constraint with `-- nq: foreign_keys=off`), `add_tests.sql` (a `json` parameter), `test_history.sql` (documented parameter and columns). Tests cover them.
 - README states the SQLite requirement: 3.35 or newer (`RETURNING` in the examples).
 

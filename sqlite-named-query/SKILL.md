@@ -94,6 +94,8 @@ Parameters can be passed three ways, and the ways can be combined (passing the s
 | `--param k=31` (repeatable) | One at a time. The value is parsed as JSON if it is valid JSON (`31`, `null`, `true`), otherwise taken as a string |
 | `--param-file k=path.md` (repeatable) | The file's contents as a single string (for long bodies; no escaping needed) |
 
+Values with non-ASCII text (Japanese, for example), line breaks, or quotes: pass them through a file (`--param-file`, or `--params-file` for several) rather than on the command line, where shell quoting can break them.
+
 A JSON array or object can only be passed to a parameter the query declares as `json` (see below); anywhere else it is refused before the query runs, with a message saying how to pass it.
 
 `--raw COLUMN` prints that column's value as-is instead of JSON when the result has exactly one row (for reading long bodies; byte-for-byte what was stored). It is an error if there is not exactly one row.

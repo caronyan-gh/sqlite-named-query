@@ -281,7 +281,15 @@ def fail(query, msg, **extra):
 
 def find_root(explicit):
     if explicit:
-        return os.path.abspath(explicit)
+        root = os.path.abspath(explicit)
+        # A wrong --root used to be accepted silently, so migrate/check ran against an empty project (and could
+        # create a stray database). Stop before touching anything and say what a root looks like.
+        if not (os.path.isdir(os.path.join(root, "db", "queries")) or os.path.isdir(os.path.join(root, "db", "migrations"))):
+            looks_like_db = os.path.isdir(os.path.join(root, "queries")) or os.path.isdir(os.path.join(root, "migrations"))
+            fail(None, f"not a project root (no db/queries or db/migrations): {root}",
+                 hint=("this looks like the db/ folder itself; pass its parent as --root" if looks_like_db else
+                       "pass the folder that contains db/ (the project root), or omit --root to search upward from cwd"))
+        return root
     cur = os.path.abspath(os.getcwd())
     while True:
         if os.path.isdir(os.path.join(cur, "db", "queries")) or os.path.isdir(os.path.join(cur, "db", "migrations")):

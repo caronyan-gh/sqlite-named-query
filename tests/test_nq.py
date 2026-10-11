@@ -290,6 +290,23 @@ class Storage(Project):
         self.assertEqual([r["query"] for r in out["runs"]], ["get_open_test"])
 
 
+class Root(Project):
+    def test_wrong_root_stops_without_creating_anything(self):
+        db_folder = os.path.join(self.root, "db")
+        code, out = self.nq("--root", db_folder, "migrate")
+        self.assertEqual(code, 1)
+        self.assertIn("not a project root", out["error"])
+        self.assertIn("parent", out["hint"])
+        self.assertFalse(os.path.exists(os.path.join(db_folder, "db")), "nothing may be created under a wrong root")
+        code, out = self.nq("--root", os.path.join(self.root, "nowhere"), "status")
+        self.assertEqual(code, 1)
+        self.assertIn("omit --root", out["hint"])
+
+    def test_right_root_still_works(self):
+        code, out = self.nq("--root", self.root, "status")
+        self.assertEqual(code, 0)
+
+
 class Arguments(Project):
     def test_argument_errors_are_json_with_usage(self):
         code, out = self.nq("stats", "--bogus")
