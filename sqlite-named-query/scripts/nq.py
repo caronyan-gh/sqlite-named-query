@@ -24,6 +24,12 @@ Commands
     backup [--label L] [--keep N]  copy the database to <root>/db/backup/project-<L>-<date-time>.db with SQLite's online
                                  backup API (safe while in use / WAL); keeps the newest N backups (default 7).
                                  When to back up is the project's decision: call this from its own scripts
+    dump [--out FILE] [--exclude TABLE ...]
+                                 write the whole database as SQL text (tables by name, rows in primary-key order:
+                                 the same database always gives the same text), to carry it to another PC or keep a
+                                 readable copy. Default <root>/db/dump/project.sql, in a folder kept out of git.
+                                 Tables listed in db/dump-exclude.txt (or --exclude) keep their schema, not their rows
+    restore FILE                 build the database from a dump (never overwrites an existing one), then run check
     stats [--days N] [--top N] [--query RE] [--table T] [--recent N]
                                  slowest queries (runs, avg/max ms, errors) and searches that found nothing, from the
                                  timing log; --query / --table narrow it to matching query names / queries using a
@@ -40,13 +46,17 @@ Header comments at the top of a query file (optional):
     -- Get one task by task_id          first plain comment line = description
     -- mode: read | write               default: read if every statement is SELECT/WITH/VALUES/EXPLAIN, else write
     -- export: name[, name...]          (write queries) refresh these text projections after a successful commit
-    -- param NAME [json|text]: meaning  document a parameter (shown by list and in parameter errors). json: a JSON
+    -- param NAME [json|text] [optional]: meaning
+                                        document a parameter (shown by list and in parameter errors). json: a JSON
                                         array/object is passed as JSON text; text: always passed as a string (a
                                         digit-only value such as a commit SHA would otherwise become a number).
-                                        An undeclared parameter given an array/object is refused before running.
+                                        optional: may be left out and is then null (use coalesce(:p, col) for
+                                        "keep as is"); there are no other defaults. An undeclared parameter given an
+                                        array/object is refused before running.
     -- column NAME: meaning             document a result column; read results then carry a "columns" object
 
 Output is always one JSON object on stdout. Standard library only.
+A connection waits NQ_BUSY_TIMEOUT_MS (default 5000) for another writer's lock.
 """
 __version__ = "0.1.0"  # see CHANGELOG.md in the repository
 
@@ -72,9 +82,20 @@ IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Added to errors caused by not knowing what queries exist, so the tool itself points the way (instructions get lost).
 LIST_HINT = ("run `nq.py list` to see every query with its parameters and description, or `nq.py list <word>` to "
              "search them (no need to open the .sql files)")
-PARAM_DECL = re.compile(r"param\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+([A-Za-z]+))?\s*(?::\s*(.*))?$", re.I)
+PARAM_DECL = re.compile(r"param\s+([A-Za-z_][A-Za-z0-9_]*)((?:\s+[A-Za-z]+)*)\s*(?::\s*(.*))?$", re.I)
 COLUMN_DECL = re.compile(r"column\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*(.*))?$", re.I)
 PARAM_TYPES = ("json", "text")
+LOCK_HINT = ("the database was locked by another writer for longer than NQ_BUSY_TIMEOUT_MS. rolled_back means this "
+             "write was not applied; before running the same write again, read the state with a read query to "
+             "confirm it (another agent may have written the same thing)")
+
+
+def busy_timeout_ms():
+    """How long a connection waits for another writer's lock (NQ_BUSY_TIMEOUT_MS, default 5000)."""
+    try:
+        return max(0, int(os.environ.get("NQ_BUSY_TIMEOUT_MS", "5000")))
+    except ValueError:
+        return 5000
 
 
 def collect_params(args, raw=None):
@@ -141,11 +162,12 @@ def bind_values(q, params, raw=None):
 
 
 def param_info(q):
-    """The query's parameters in order, each as {name, type?, doc?} (absent keys are omitted)."""
+    """The query's parameters in order, each as {name, type?, optional?, doc?} (absent keys are omitted)."""
     info = []
     for p in q["params"]:
         d = q["param_decls"].get(p, {})
-        info.append({"name": p, **({"type": d["type"]} if d.get("type") else {}), **({"doc": d["doc"]} if d.get("doc") else {})})
+        info.append({"name": p, **({"type": d["type"]} if d.get("type") else {}),
+                     **({"optional": True} if d.get("optional") else {}), **({"doc": d["doc"]} if d.get("doc") else {})})
     return info
 
 
@@ -286,8 +308,11 @@ def find_root(explicit):
         # create a stray database). Stop before touching anything and say what a root looks like.
         if not (os.path.isdir(os.path.join(root, "db", "queries")) or os.path.isdir(os.path.join(root, "db", "migrations"))):
             looks_like_db = os.path.isdir(os.path.join(root, "queries")) or os.path.isdir(os.path.join(root, "migrations"))
+            inside_db = (os.path.basename(root).lower() in ("queries", "migrations", "exports", "backup", "stats", "dump")
+                         and os.path.basename(os.path.dirname(root)).lower() == "db")
             fail(None, f"not a project root (no db/queries or db/migrations): {root}",
                  hint=("this looks like the db/ folder itself; pass its parent as --root" if looks_like_db else
+                       f"this looks like db/{os.path.basename(root)}; pass the folder two levels up as --root" if inside_db else
                        "pass the folder that contains db/ (the project root), or omit --root to search upward from cwd"))
         return root
     cur = os.path.abspath(os.getcwd())
@@ -362,11 +387,15 @@ def parse_query(path):
         elif x:
             exports += [e.strip() for e in x.group(1).split(",") if e.strip()]
         elif pd:
-            kind = (pd.group(2) or "").lower() or None
-            if kind and kind not in PARAM_TYPES:
-                bad_decls.append(f"unknown parameter type '{pd.group(2)}' (use json or text): {body}")
-                kind = None
-            param_decls[pd.group(1)] = {"type": kind, "doc": (pd.group(3) or "").strip() or None}
+            kind, optional = None, False
+            for word in (pd.group(2) or "").split():
+                if word.lower() in PARAM_TYPES and kind is None:
+                    kind = word.lower()
+                elif word.lower() == "optional":
+                    optional = True
+                else:
+                    bad_decls.append(f"unknown parameter type '{word}' (use json or text, and optional): {body}")
+            param_decls[pd.group(1)] = {"type": kind, "optional": optional, "doc": (pd.group(3) or "").strip() or None}
         elif cd:
             column_docs[cd.group(1)] = (cd.group(2) or "").strip() or None
         elif re.match(r"(param|column)\b", body, re.I):
@@ -448,6 +477,9 @@ def db_path(root, explicit):
     """--db if given; else <root>/db/project.db if it exists; else a legacy <root>/project.db if that exists;
     else <root>/db/project.db (where a new database is created)."""
     if explicit:
+        if os.path.isdir(explicit):
+            fail(None, f"--db is a folder, not a database file: {os.path.abspath(explicit)}",
+                 hint="pass the database file (e.g. db/project.db), or omit --db to use <root>/db/project.db")
         return os.path.abspath(explicit)
     new, legacy = os.path.join(root, "db", "project.db"), os.path.join(root, "project.db")
     if not os.path.exists(new) and os.path.exists(legacy):
@@ -459,12 +491,12 @@ def connect(path, read_only):
     if read_only:
         if not os.path.exists(path):
             raise sqlite3.OperationalError(f"database does not exist: {path} (run migrate first)")
-        con = sqlite3.connect(ro_uri(path), uri=True, timeout=5.0, isolation_level=None)
+        con = sqlite3.connect(ro_uri(path), uri=True, timeout=busy_timeout_ms() / 1000, isolation_level=None)
     else:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+        con = sqlite3.connect(path, timeout=busy_timeout_ms() / 1000, isolation_level=None)
         con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
+    con.execute(f"PRAGMA busy_timeout={busy_timeout_ms()}")
     con.execute("PRAGMA foreign_keys=ON")
     con.row_factory = sqlite3.Row
     return con
@@ -539,6 +571,11 @@ def cmd_run(args, root):
         params = collect_params(args, raw)
     except (ValueError, OSError) as e:
         fail(name, f"invalid params: {e}")
+    # A parameter declared optional may be left out; it is then bound as null (pair it with coalesce(:p, col) to mean
+    # "keep as is"). There are no other defaults: anything else must be passed.
+    for p in q["params"]:
+        if p not in params and q["param_decls"].get(p, {}).get("optional"):
+            params[p] = None
     missing = [p for p in q["params"] if p not in params]
     extra = [p for p in params if p not in q["params"]]
     if missing or extra:
@@ -582,6 +619,8 @@ def cmd_run(args, root):
                 affected += cur.rowcount
         con.execute("COMMIT")
         res = {"ok": True, "query": name, "mode": "write", "affected_rows": affected}
+        if affected == 0 and not returned:
+            res["warning"] = "no rows were changed; if a change was expected, check the parameters (for example the id)"
         if returned:
             res["rows"] = returned[:args.max_rows]
             res["row_count"] = len(res["rows"])
@@ -602,7 +641,8 @@ def cmd_run(args, root):
             con.execute("ROLLBACK")
         except sqlite3.Error:
             pass
-        fail(name, str(e), rolled_back=not read_only)
+        locked = isinstance(e, sqlite3.OperationalError) and re.search(r"locked|busy", str(e), re.I)
+        fail(name, str(e), rolled_back=not read_only, **({"hint": LOCK_HINT} if locked and not read_only else {}))
 
 
 def migrations(root):
@@ -738,11 +778,16 @@ def cmd_status(args, root):
 
 
 def cmd_check(args, root):
+    res = check_result(root, args.db)
+    emit(res, 0 if res["ok"] else 1)
+
+
+def check_result(root, db):
     """Static + compile check of the project's db/ folder: applied migrations unchanged (checksum), query/export
     headers consistent, exports exist and only use parameters their triggering queries have, and every statement
     compiles (EXPLAIN) against the current database. Nothing is executed or written."""
     problems, notes = [], []
-    path = db_path(root, args.db)
+    path = db_path(root, db)
     mdir, files = migrations(root)
     pending = []
     if os.path.exists(path):
@@ -837,8 +882,160 @@ def cmd_check(args, root):
                     problems.append(f"query {name}: export {ex} needs parameters the query does not take: {extra}")
         compile_ok(f"query {name}", q["statements"], q["params"])
         docs_ok(f"query {name}", q)
-    emit({"ok": not problems, "root": root, "queries": count, "exports": len(exports), "migrations": len(files),
-          "problems": problems, "notes": notes}, 0 if not problems else 1)
+    if con is not None:
+        con.close()
+    return {"ok": not problems, "root": root, "queries": count, "exports": len(exports), "migrations": len(files),
+            "problems": problems, "notes": notes}
+
+
+def sql_literal(v):
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v) if v == v and v not in (float("inf"), float("-inf")) else "NULL"
+    if isinstance(v, bytes):
+        return "X'" + v.hex().upper() + "'"
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def qident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def dump_excluded(root, extra):
+    """Tables whose rows a dump leaves out: db/dump-exclude.txt (one name per line, # comments) plus --exclude."""
+    names = list(extra or [])
+    path = os.path.join(root, "db", "dump-exclude.txt")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8-sig") as fh:
+            names += [ln.split("#", 1)[0].strip() for ln in fh]
+    return sorted({n for n in names if n})
+
+
+def dump_lines(con, exclude=()):
+    """The whole database as SQL text that rebuilds it: tables (by name), their rows in primary-key order (rowid when
+    there is none), then indexes, views and triggers. Same database, same text: nothing depends on the time or on the
+    physical row order. Triggers come last so restoring rows does not fire them. Rowids are kept, so a restore is
+    exact. Tables in `exclude` keep their schema but not their rows (bulky logs that the same-PC backup covers)."""
+    yield f"-- nq.py {__version__} dump (restore with: nq.py restore FILE)"
+    uv = con.execute("PRAGMA user_version").fetchone()[0]
+    yield "PRAGMA foreign_keys=OFF;"
+    yield "BEGIN TRANSACTION;"
+    if uv:
+        yield f"PRAGMA user_version={uv};"
+    objs = con.execute("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid").fetchall()
+    tables = sorted((o for o in objs if o[0] == "table" and not o[1].startswith("sqlite_")), key=lambda o: o[1])
+    for _, name, _, sql in tables:
+        yield sql.strip() + ";"
+    for _, name, _, sql in tables:
+        if name in exclude:
+            yield f"-- rows of {name} left out (dump-exclude)"
+            continue
+        info = con.execute(f"PRAGMA table_info({qident(name)})").fetchall()
+        cols = [c[1] for c in info]
+        pk = [c for c in sorted((c for c in info if c[5]), key=lambda c: c[5])]
+        without_rowid = re.search(r"\bWITHOUT\s+ROWID\b", sql or "", re.I)
+        rowid_alias = len(pk) == 1 and (pk[0][2] or "").upper() == "INTEGER"
+        keep_rowid = not without_rowid and not rowid_alias  # otherwise the rowid is the key itself, or there is none
+        order = ", ".join(qident(c[1]) for c in pk) if pk else ("" if without_rowid else "rowid")
+        collist = ", ".join(([] if not keep_rowid else ["rowid"]) + [qident(c) for c in cols])
+        for row in con.execute(f"SELECT {collist} FROM {qident(name)}" + (f" ORDER BY {order}" if order else "")):
+            yield f"INSERT INTO {qident(name)}({collist}) VALUES({', '.join(sql_literal(v) for v in row)});"
+    if con.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+        yield "DELETE FROM sqlite_sequence;"
+        for name, seq in con.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name"):
+            yield f"INSERT INTO sqlite_sequence(name, seq) VALUES({sql_literal(name)}, {seq});"
+    for kind in ("index", "view", "trigger"):
+        for o in objs:
+            if o[0] == kind:
+                yield o[3].strip() + ";"
+    yield "COMMIT;"
+
+
+def cmd_dump(args, root):
+    """Write the database as SQL text (see dump_lines). Default: <root>/db/dump/project.sql in a folder with its own
+    .gitignore, because a project's database may hold things that should not go into git; pass --out to choose."""
+    src = db_path(root, args.db)
+    if not os.path.exists(src):
+        fail(None, f"database does not exist: {src}")
+    if args.out:
+        target = os.path.abspath(args.out)
+    else:
+        ddir = os.path.join(root, "db", "dump")
+        os.makedirs(ddir, exist_ok=True)
+        ignore = os.path.join(ddir, ".gitignore")
+        if not os.path.exists(ignore):
+            with open(ignore, "w", encoding="utf-8") as fh:
+                fh.write("# created by nq.py dump: keep database dumps out of git unless you put them elsewhere on purpose\n*\n")
+        target = os.path.join(ddir, "project.sql")
+    con = connect(src, True)
+    exclude = dump_excluded(root, args.exclude)
+    known = {n for (n,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    unknown = [t for t in exclude if t not in known]
+    if unknown:
+        fail(None, f"dump-exclude names tables the database does not have: {unknown}")
+    # Rows that point at a left-out table would fail the foreign key check on restore: say so now.
+    warnings = [f"{t} has a foreign key to {fk[2]}, whose rows are left out: restore will fail its foreign key check "
+                f"unless {t} is left out too" for t in sorted(known - set(exclude)) if not t.startswith("sqlite_")
+                for fk in con.execute(f"PRAGMA foreign_key_list({qident(t)})") if fk[2] in exclude]
+    tmp = target + ".nq-tmp"
+    try:
+        con.execute("BEGIN")  # one consistent snapshot even while others write
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        n = 0
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            for line in dump_lines(con, exclude):
+                fh.write(line + "\n")
+                n += line.startswith("INSERT INTO ")
+        con.execute("COMMIT")
+        os.replace(tmp, target)
+    except (sqlite3.Error, OSError) as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        fail(None, f"dump failed: {e}")
+    emit({"ok": True, "db": src, "dump": target, "rows": n, **({"excluded": exclude} if exclude else {}),
+          **({"warnings": sorted(set(warnings))} if warnings else {})})
+
+
+def cmd_restore(args, root):
+    """Build the database from a dump. Never overwrites: the target (--db or <root>/db/project.db) must not exist.
+    Foreign keys are checked after loading, then `check` runs and its result is returned as "check"."""
+    target = db_path(root, args.db)
+    if os.path.exists(target):
+        fail(None, f"database already exists: {target}",
+             hint="restore never overwrites. Move the existing database away (nq.py backup first if it matters), "
+                  "or restore to another file with --db")
+    try:
+        with open(args.file, encoding="utf-8-sig", newline="") as fh:  # newline="": keep \r inside text values
+            sql = fh.read()
+    except OSError as e:
+        fail(None, f"cannot read dump: {e}")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = target + ".nq-tmp"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    try:
+        con = sqlite3.connect(tmp, isolation_level=None)
+        try:
+            con.executescript(sql)
+            bad = con.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                raise sqlite3.IntegrityError(f"foreign_key_check failed: {[tuple(r) for r in bad[:5]]}")
+            con.execute("PRAGMA journal_mode=WAL")
+        finally:
+            con.close()
+        os.replace(tmp, target)
+    except (sqlite3.Error, OSError) as e:
+        for f in (tmp, tmp + "-wal", tmp + "-shm"):
+            if os.path.exists(f):
+                os.remove(f)
+        fail(None, f"restore failed (nothing was written): {e}")
+    res = check_result(root, args.db)
+    emit({"ok": res["ok"], "db": target, "restored_from": os.path.abspath(args.file), "check": res}, 0 if res["ok"] else 1)
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -884,6 +1081,12 @@ def main():
     st.add_argument("--query", help="only queries whose name matches this (case-insensitive regex, e.g. '^task_')")
     st.add_argument("--table", help="only queries whose SQL uses this table")
     st.add_argument("--recent", type=int, default=0, metavar="N", help="show the latest N runs one by one instead of totals")
+    d = sub.add_parser("dump")
+    d.add_argument("--out", help="where to write the SQL text (default: <root>/db/dump/project.sql, kept out of git)")
+    d.add_argument("--exclude", action="append", metavar="TABLE",
+                   help="leave this table's rows out (repeatable; added to db/dump-exclude.txt)")
+    rs = sub.add_parser("restore")
+    rs.add_argument("file", help="a dump written by nq.py dump")
     x = sub.add_parser("export")
     x.add_argument("name")
     x.add_argument("--params", help="JSON object of named parameters")
@@ -898,7 +1101,8 @@ def main():
     try:
         try:
             {"list": cmd_list, "run": cmd_run, "migrate": cmd_migrate, "status": cmd_status, "export": cmd_export,
-             "check": cmd_check, "backup": cmd_backup, "stats": cmd_stats}[args.cmd](args, root)
+             "check": cmd_check, "backup": cmd_backup, "stats": cmd_stats, "dump": cmd_dump,
+             "restore": cmd_restore}[args.cmd](args, root)
         except SystemExit:
             raise
         except Exception as e:  # keep the "always one JSON object" contract

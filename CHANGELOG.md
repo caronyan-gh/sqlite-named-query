@@ -4,9 +4,15 @@
 
 ## Unreleased
 
-Output of existing commands is unchanged; the one behavior change is that a wrong `--root` is now an error.
+Output of existing commands is unchanged apart from new keys (`optional` in parameter info, `warning` on writes that changed nothing, `hint` on lock failures); the behavior changes are that a wrong `--root` and a folder given as `--db` are now errors.
 
 ### Added
+- Optional parameters: `-- param NAME optional: …` lets a caller leave the parameter out; it is then bound as null (use `coalesce(:NAME, col)` for "keep as is"). Null is the only default; undeclared parameters are still required.
+- `nq.py dump [--out FILE]` writes the whole database as SQL text: tables by name, rows in primary-key order, then indexes, views and triggers, so the same database gives the same text. Default `db/dump/project.sql` in a folder with its own `.gitignore`. Tables listed in `db/dump-exclude.txt` (or `--exclude`) keep their schema but not their rows; rowids are kept. `nq.py restore FILE` builds the database from it (never overwrites an existing one), checks foreign keys, and runs `check`.
+- `NQ_BUSY_TIMEOUT_MS` sets how long a connection waits for another writer's lock (default 5000). A write that fails on a lock returns a `hint`: it was not applied, and the state should be read before running it again.
+- A write that changed no rows (and returned none) carries a `warning`.
+- `--root` pointing inside `db/` (for example `db/queries`) says to pass the folder two levels up.
+- SKILL.md: optional parameters and a separate query for clearing a value; `WHERE true` for `INSERT … SELECT … FROM t ON CONFLICT`; JSON parameters through `--params-file` on Windows; direct read-only exploration is fine but reported numbers come from a named query run then.
 - A `--root` that has neither `db/queries` nor `db/migrations` stops before anything is read or created, with a hint (for example "this looks like the db/ folder itself; pass its parent"). It used to be accepted silently, so `migrate`/`check` ran against an empty project.
 - SKILL.md: values with non-ASCII text, line breaks, or quotes go through `--param-file` / `--params-file`.
 - Examples: `002_add_status_check.sql` (rebuilding a table to add a CHECK constraint with `-- nq: foreign_keys=off`), `add_tests.sql` (a `json` parameter), `test_history.sql` (documented parameter and columns). Tests cover them.

@@ -307,6 +307,106 @@ class Root(Project):
         self.assertEqual(code, 0)
 
 
+def read_text(path):
+    with open(path, encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+class Optional(Project):
+    def test_declared_optional_may_be_left_out_as_null(self):
+        self.migrate()
+        self.write("db/queries/set_test.sql", "-- Update a test; left-out fields keep their value\n"
+                   "-- param title optional: new title\n-- param status optional: new status\n"
+                   "UPDATE tests SET title = coalesce(:title, title), status = coalesce(:status, status) "
+                   "WHERE test_id = :id;\n")
+        code, out = self.nq("run", "set_test", "--param", "id=T-A-001", "--param", "status=passed")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.db().execute("SELECT title, status FROM tests WHERE test_id='T-A-001'").fetchone(),
+                         ("alpha", "passed"))
+        code, out = self.nq("run", "set_test", "--param", "status=x")  # id is not optional
+        self.assertEqual(out["missing"], ["id"])
+        code, out = self.nq("list", "set_test")
+        self.assertEqual([p.get("optional") for p in out["queries"][0]["params"]], [True, True, None])
+
+
+class DumpRestore(Project):
+    def test_dump_is_stable_and_restores(self):
+        self.migrate()
+        self.nq("run", "close_test", "--param", "test_id=T-A-002", "--param", "result=line1\r\nline2 'q'")
+        code, out = self.nq("dump")
+        self.assertEqual(code, 0, out)
+        first = read_text(out["dump"])
+        with open(os.path.join(self.root, "db", "dump", ".gitignore"), encoding="utf-8") as fh:
+            self.assertIn("*", fh.read())
+        code, out = self.nq("dump", "--out", os.path.join(self.root, "again.sql"))
+        self.assertEqual(read_text(out["dump"]), first, "same db, same text")
+        code, out = self.nq("restore", out["dump"])
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", out["error"])
+        target = os.path.join(self.root, "copy.db")
+        code, out = self.nq("--db", target, "restore", os.path.join(self.root, "again.sql"))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["check"]["ok"])
+        a, b = self.db(), sqlite3.connect(target)
+        for t in ("tests", "test_runs", "_nq_migrations"):
+            self.assertEqual(a.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall(),
+                             b.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall(), t)
+        b.close()
+
+    def test_dump_exclude_keeps_schema_not_rows(self):
+        self.migrate()
+        self.nq("run", "close_test", "--param", "test_id=T-A-001", "--param", "result=passed")
+        self.write("db/dump-exclude.txt", "# bulky logs\ntest_runs\n")
+        code, out = self.nq("dump")
+        self.assertEqual(out["excluded"], ["test_runs"])
+        self.assertNotIn("warnings", out)  # test_runs points at tests, not the other way round
+        target = os.path.join(self.root, "copy.db")
+        code, out = self.nq("--db", target, "restore", out["dump"])
+        self.assertEqual(code, 0, out)
+        b = sqlite3.connect(target)
+        self.assertEqual(b.execute("SELECT count(*) FROM test_runs").fetchone()[0], 0)
+        self.assertEqual(b.execute("SELECT status FROM tests WHERE test_id='T-A-001'").fetchone()[0], "passed")
+        b.close()
+        os.remove(os.path.join(self.root, "db", "dump-exclude.txt"))
+        code, out = self.nq("dump", "--exclude", "tests", "--out", os.path.join(self.root, "x.sql"))
+        self.assertIn("test_runs has a foreign key to tests", out["warnings"][0])
+        code, out = self.nq("dump", "--exclude", "nope")
+        self.assertIn("does not have", out["error"])
+
+
+class Writes(Project):
+    def test_zero_rows_changed_warns(self):
+        self.migrate()
+        code, out = self.nq("run", "close_test", "--param", "test_id=NOPE", "--param", "result=passed")
+        self.assertEqual(code, 1)  # the test_runs foreign key refuses the unknown id
+        self.write("db/queries/touch.sql", "-- Touch\nUPDATE tests SET updated_at = 'x' WHERE test_id = :id;\n")
+        code, out = self.nq("run", "touch", "--param", "id=NOPE")
+        self.assertEqual((code, out["affected_rows"]), (0, 0))
+        self.assertIn("no rows were changed", out["warning"])
+        code, out = self.nq("run", "touch", "--param", "id=T-A-001")
+        self.assertNotIn("warning", out)
+
+    def test_lock_timeout_hint(self):
+        self.migrate()
+        self.write("db/queries/touch.sql", "-- Touch\nUPDATE tests SET updated_at = 'x' WHERE test_id = :id;\n")
+        holder = sqlite3.connect(os.path.join(self.root, "db", "project.db"), isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            code, out = self.nq("run", "touch", "--param", "id=T-A-001", env={"NQ_BUSY_TIMEOUT_MS": "200"})
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertEqual(code, 1)
+        self.assertTrue(out["rolled_back"])
+        self.assertIn("read the state", out["hint"])
+
+    def test_root_inside_db_and_db_folder(self):
+        code, out = self.nq("--root", os.path.join(self.root, "db", "queries"), "check")
+        self.assertIn("two levels up", out["hint"])
+        code, out = self.nq("--db", os.path.join(self.root, "db"), "status")
+        self.assertIn("is a folder", out["error"])
+
+
 class Arguments(Project):
     def test_argument_errors_are_json_with_usage(self):
         code, out = self.nq("stats", "--bogus")

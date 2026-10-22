@@ -82,6 +82,8 @@ python $NQ export test_summary      # run a projection by hand
 python $NQ check                    # lint db/ (executes and writes nothing)
 python $NQ backup --label task-090  # copy the database to db/backup/project-task-090-<date-time>.db
 python $NQ stats                    # timing log: slowest queries and searches that found nothing
+python $NQ dump                     # the whole database as SQL text (db/dump/project.sql, kept out of git)
+python $NQ restore project.sql      # build the database from a dump (never overwrites), then check
 ```
 
 Every option of a command is in `nq.py <command> --help`; a wrong option also returns that command's usage as JSON.
@@ -94,7 +96,7 @@ Parameters can be passed three ways, and the ways can be combined (passing the s
 | `--param k=31` (repeatable) | One at a time. The value is parsed as JSON if it is valid JSON (`31`, `null`, `true`), otherwise taken as a string |
 | `--param-file k=path.md` (repeatable) | The file's contents as a single string (for long bodies; no escaping needed) |
 
-Values with non-ASCII text (Japanese, for example), line breaks, or quotes: pass them through a file (`--param-file`, or `--params-file` for several) rather than on the command line, where shell quoting can break them.
+Values with non-ASCII text (Japanese, for example), line breaks, or quotes: pass them through a file (`--param-file`, or `--params-file` for several) rather than on the command line, where shell quoting can break them. On Windows, the same goes for JSON: when in doubt, write the object to a file and use `--params-file`.
 
 A JSON array or object can only be passed to a parameter the query declares as `json` (see below); anywhere else it is refused before the query runs, with a message saying how to pass it.
 
@@ -107,7 +109,7 @@ python $NQ run task_get --param task_id=31 --raw instruction_md                 
 
 Read results are capped at 200 rows by default (`--max-rows`). Beyond that, `truncated: true` is set.
 
-Every `run` and `list <word>` is timed and logged to `db/stats/nq-stats.db`; it is on by default, and `NQ_STATS=0` keeps a call out of it (for example a dashboard that refreshes every few seconds). Details on backups and the timing log are in `references/reference.md`.
+Every `run` and `list <word>` is timed and logged to `db/stats/nq-stats.db`; it is on by default, and `NQ_STATS=0` keeps a call out of it (for example a dashboard that refreshes every few seconds). Details on backups, dumps and the timing log are in `references/reference.md`.
 
 ## Writing a query file
 
@@ -126,16 +128,20 @@ Document parameters and result columns in the header, so callers never need to o
 -- param items json: one run's items, [{step, rank, item, reason}]   ← json: arrays/objects are passed as JSON text
 -- param sha text: commit SHA                                         ← text: always a string (1234567 stays "1234567")
 -- param owner: role that ran it                                      ← no type: as given
+-- param note optional: new note; left out = keep the current one     ← optional: may be left out, and is then null
 -- column via: where the link was found (traceability | tests | graph)
 ```
 
+A parameter declared `optional` can be left out and is then bound as null; pair it with `coalesce` to mean "keep as is": `UPDATE tasks SET note = coalesce(:note, note) WHERE task_id = :task_id`. Null is the only default — every other parameter must be passed. Because null means "keep", such a query cannot clear a value; make a separate query for that (for example `task_clear_note`).
+
 - Before writing any SQL of your own, search for an existing query with `list <word>`: it matches names, descriptions, and parameter and column docs. "No match" also returns every query's name and description, so an empty search never means "no such query" by itself.
-- `list` shows each parameter as `{"name", "type", "doc"}` (missing keys are omitted), and a parameter-mismatch error shows the same. Columns documented with `-- column` appear as `columns` in `list` and in every result of that query. Add a doc only where a name is not self-explanatory: null meaning "all", units, allowed values, JSON shape.
+- `list` shows each parameter as `{"name", "type", "optional", "doc"}` (missing keys are omitted), and a parameter-mismatch error shows the same. Columns documented with `-- column` appear as `columns` in `list` and in every result of that query. Add a doc only where a name is not self-explanatory: null meaning "all", units, allowed values, JSON shape.
 - `check` reports a `-- param` or `-- column` line that names something the query does not have, so docs cannot silently go stale.
 - Use SQLite named parameters (`:name`). Values are always bound; never build SQL by string concatenation.
 - If the parameters you pass do not match the ones in the query (missing or extra), the query is not run and an error is returned (catches typos).
 - **read**: exactly one statement. The database is opened read-only, so writes are physically impossible. Declaring `mode: read` on a query that contains a write statement is an error.
-- **write**: may contain several statements. They run in a single transaction (`BEGIN IMMEDIATE`); if any fails, everything is rolled back. Rows from `RETURNING` go into `rows`.
+- **write**: may contain several statements. They run in a single transaction (`BEGIN IMMEDIATE`); if any fails, everything is rolled back. Rows from `RETURNING` go into `rows`. When nothing changed (`affected_rows: 0`, no returned rows), the result carries a `warning`: a wrong id is the usual cause, but it is also normal for something like `INSERT OR IGNORE` of an existing row.
+- In `INSERT … SELECT … ON CONFLICT … DO UPDATE`, when the SELECT ends with its `FROM` (no `WHERE`, `GROUP BY`, ...), SQLite reads `ON` as a join condition and fails with a syntax error near `DO`. Add `WHERE true`: `INSERT INTO latest(k, v) SELECT k, v FROM incoming WHERE true ON CONFLICT(k) DO UPDATE SET v = excluded.v`.
 
 **Exports** (`db/exports/<name>.sql`) are single read statements returning `path` and `content` columns; a write query lists them in `-- export:` and they run after its COMMIT, writing each row's `content` to `<root>/<path>`. See `references/reference.md` before writing one.
 
@@ -144,7 +150,7 @@ Document parameters and result columns in the header, so callers never need to o
 ## Operating rules
 
 1. SQLite is the source of truth for project state. Do not edit exported text as if it were state.
-2. Do not run SQL on the fly. Use only the named queries in `db/queries`; when you need a new read or write, add a query file and use that.
+2. Do not run SQL on the fly. Use only the named queries in `db/queries`; when you need a new read or write, add a query file and use that. While exploring (working out what a new query should return), reading the database directly is fine if it is read-only — but anything you report or act on comes from a named query run at that moment.
 3. Queries and schema are added or changed as files. Schema changes go into `db/migrations` as new numbered files; never edit an applied migration (`check` detects it).
 4. Run `check` after adding or changing queries, exports or migrations. The user does not need to review them; `list` shows everything if they want to look.
 5. Keep returned columns and rows to the minimum needed, in the query itself.
@@ -153,5 +159,5 @@ Document parameters and result columns in the header, so callers never need to o
 
 ## More
 
-- `references/reference.md`: exports, rebuilding tables, what `check` verifies, backups, the timing log, concurrency. Read the section before doing that task.
+- `references/reference.md`: exports, rebuilding tables, what `check` verifies, backups, dump and restore, the timing log, concurrency (lock waits, `NQ_BUSY_TIMEOUT_MS`). Read the section before doing that task.
 - `references/lessons.md`: lessons from running this skill with several agents on a real project — how to shape the schema, early mistakes, capturing time, and tips such as generating handoff notes and moving text into the database. Read it when you start designing a project's database, and when something in daily use goes wrong or feels awkward.

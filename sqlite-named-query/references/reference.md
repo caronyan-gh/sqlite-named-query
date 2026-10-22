@@ -51,6 +51,15 @@ Migrations applied before checksums were introduced are recorded from the curren
 
 `backup` copies the database with SQLite's online backup API, so it is safe while the database is in use (WAL included). Backups go to `db/backup/project-<label>-<YYYYMMDD-HHMMSS>.db` (just `project-<YYYYMMDD-HHMMSS>.db` without `--label`; the date-time means the same label never overwrites an earlier backup), only the newest `--keep` (default 7) are kept — "newest" is read from the date-time in the file name, not the file's modified time, which copying or unzipping can reset — and `db/backup/` gets its own `.gitignore` so backups never end up in git. The command only backs up when called; when to call it (every tenth task, before a risky migration, ...) is the project's decision, typically made in one of its own scripts. A failed backup returns `ok: false` and changes nothing, so the caller can warn and carry on.
 
+## Dump and restore
+
+`backup` keeps copies on the same PC. To carry the database somewhere else, or to keep a copy you can read and diff, use `dump`: it writes the whole database as SQL text — tables by name, rows in primary-key order (rowid when a table has none), then indexes, views and triggers — so the same database always gives the same text. The timing log is a separate file and is not included.
+
+- Default destination: `db/dump/project.sql`, in a folder with its own `.gitignore`, because a project's database can hold things that should not be in git (meeting notes, internal names). Whether a dump goes into git is the project's decision: pass `--out <path>` to put it somewhere else.
+- Bulky tables that grow on every run (test logs, for example) can be left out: list them in `db/dump-exclude.txt`, one table name per line (`#` starts a comment), or pass `--exclude TABLE`. Their schema stays in the dump, their rows do not; the same-PC `backup` still covers them. The dump stays small enough to read and diff, which compressing it would not. If a kept table has a foreign key to a left-out one, `dump` warns that the restore would fail its foreign key check.
+- Rowids are kept, so a restore gives back the same rows with the same rowids.
+- `restore FILE` builds the database from a dump. It never overwrites: the target (`db/project.db`, or `--db`) must not exist. Foreign keys are checked after loading, then `check` runs and its result comes back as `check`. Triggers are created after the rows, so restoring does not fire them.
+
 ## Timing log
 
 Every `run` and `list <word>` is timed and logged quietly to `db/stats/nq-stats.db` (a separate, git-ignored file; the last 30 days are kept). Logging is on by default. Set `NQ_STATS=0` for calls that should not be counted — for example a dashboard that refreshes every few seconds — or to turn it off entirely. You do not need to look at it during normal work. When something feels slow, or a search keeps finding nothing, check `nq.py stats` (narrow it with `--table`, `--query`, or `--recent N`) instead of guessing.
@@ -58,5 +67,5 @@ Every `run` and `list <word>` is timed and logged quietly to `db/stats/nq-stats.
 ## Concurrency
 
 - Write connections use WAL mode, so they do not block readers.
-- `busy_timeout` is 5 seconds. Several agents writing at the same time wait for each other instead of failing.
+- `busy_timeout` is 5 seconds (`NQ_BUSY_TIMEOUT_MS` changes it). Several agents writing at the same time wait for each other instead of failing. If a write still fails with "database is locked", the result says `rolled_back: true` and has a `hint`: the write was not applied, but before running it again, read the state with a read query — another agent may already have written the same thing.
 - Foreign keys are enforced (`PRAGMA foreign_keys=ON`).
