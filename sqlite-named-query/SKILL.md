@@ -84,6 +84,7 @@ python $NQ backup --label task-090  # copy the database to db/backup/project-tas
 python $NQ stats                    # timing log: slowest queries and searches that found nothing
 python $NQ dump                     # the whole database as SQL text (db/dump/project.sql, kept out of git)
 python $NQ restore project.sql      # build the database from a dump (never overwrites), then check
+python $NQ batch --file rec.json    # several named queries from one JSON file, in one transaction
 ```
 
 Every option of a command is in `nq.py <command> --help`; a wrong option also returns that command's usage as JSON.
@@ -96,7 +97,11 @@ Parameters can be passed three ways, and the ways can be combined (passing the s
 | `--param k=31` (repeatable) | One at a time. The value is parsed as JSON if it is valid JSON (`31`, `null`, `true`), otherwise taken as a string |
 | `--param-file k=path.md` (repeatable) | The file's contents as a single string (for long bodies; no escaping needed) |
 
-Values with non-ASCII text (Japanese, for example), line breaks, or quotes: pass them through a file (`--param-file`, or `--params-file` for several) rather than on the command line, where shell quoting can break them. On Windows, the same goes for JSON: when in doubt, write the object to a file and use `--params-file`.
+Values with non-ASCII text (Japanese, for example), line breaks, or quotes: pass them through a file (`--param-file`, or `--params-file` for several) rather than on the command line, where shell quoting can break them. Prefer a file over a heredoc too: some agent shells rewrite commands and can break the `\` inside a heredoc.
+
+On Windows, text on the command line arrives intact; what gets garbled is reading nq's UTF-8 output as cp932 (Python's default there). Set `PYTHONUTF8=1` (a user environment variable), or read the output as UTF-8 (`subprocess.run(..., encoding='utf-8')`, `sys.stdin.reconfigure(encoding='utf-8')`).
+
+To record several things at once (a decision, a task, its completion), put them in one file, `[{"query": "decision_add", "params": {...}}, {"query": "task_add", "params": {...}}]`, and run `nq.py batch --file rec.json` instead of writing a script that calls `run` again and again. Every item is checked before anything runs, the writes are all-or-nothing, exports run once after the commit, and the results come back in order. Items do not pass values to each other; when one write needs another's new id, make a single write query that does both.
 
 A JSON array or object can only be passed to a parameter the query declares as `json` (see below); anywhere else it is refused before the query runs, with a message saying how to pass it.
 

@@ -374,6 +374,48 @@ class DumpRestore(Project):
         self.assertIn("does not have", out["error"])
 
 
+class Batch(Project):
+    def batch(self, items, **kw):
+        path = self.write("batch.json", json.dumps(items, ensure_ascii=False))
+        return self.nq("batch", "--file", path, **kw)
+
+    def test_items_run_in_order_in_one_transaction(self):
+        self.migrate()
+        code, out = self.batch([
+            {"query": "close_test", "params": {"test_id": "T-A-001", "result": "合格"}},
+            {"query": "close_test", "params": {"test_id": "T-A-001", "result": "合格"}},
+            {"query": "get_open_test"}])
+        self.assertEqual(code, 0, out)
+        self.assertEqual([r["mode"] for r in out["results"]], ["write", "write", "read"])
+        self.assertEqual([r["test_id"] for r in out["results"][2]["rows"]], ["T-A-002"])
+        self.assertEqual(len(out["results"][0]["exports"]), 2)
+        self.assertNotIn("exports", out["results"][1], "the same export with the same parameters runs once")
+        self.assertEqual(self.db().execute("SELECT count(*) FROM test_runs").fetchone()[0], 2)
+
+    def test_a_wrong_item_stops_everything_before_running(self):
+        self.migrate()
+        code, out = self.batch([
+            {"query": "close_test", "params": {"test_id": "T-A-001", "result": "passed"}},
+            {"query": "close_test", "params": {"test_id": "T-A-002"}}])
+        self.assertEqual((code, out["item"], out["missing"]), (1, 1, ["result"]))
+        self.assertIn("nothing was run", out["error"])
+        self.assertEqual(self.db().execute("SELECT count(*) FROM test_runs").fetchone()[0], 0)
+
+    def test_a_failing_item_rolls_back_the_earlier_ones(self):
+        self.migrate()
+        code, out = self.batch([
+            {"query": "close_test", "params": {"test_id": "T-A-001", "result": "passed"}},
+            {"query": "close_test", "params": {"test_id": "NOPE", "result": "passed"}}])
+        self.assertEqual((code, out["item"], out["rolled_back"]), (1, 1, True))
+        self.assertEqual(self.db().execute("SELECT status FROM tests WHERE test_id='T-A-001'").fetchone()[0], "open")
+
+    def test_items_are_logged_one_by_one(self):
+        self.migrate()
+        self.batch([{"query": "get_open_test"}, {"query": "get_open_test"}], env={"NQ_STATS": "1"})
+        code, out = self.nq("stats")
+        self.assertEqual(out["queries"][0]["runs"], 2)
+
+
 class Writes(Project):
     def test_zero_rows_changed_warns(self):
         self.migrate()

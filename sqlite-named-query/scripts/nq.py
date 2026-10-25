@@ -16,6 +16,10 @@ Commands
                                  run a named query; parameters are bound (never string-concatenated).
                                  --param-file feeds a text file (e.g. a markdown body) as one parameter;
                                  --raw prints one column of the single result row as plain text
+    batch --file F [--max-rows N]
+                                 run several named queries from a JSON file, [{"query": NAME, "params": {...}}, ...],
+                                 in one transaction: every item is checked first (nothing runs if one is wrong), writes
+                                 are all-or-nothing, exports run once after the commit. Results come back in order
     migrate                      create/upgrade the database by applying pending migrations
     status                       database path, applied migrations, pending migrations
     export NAME [--params JSON]  run db/exports/NAME.sql and write its (path, content) rows as text files
@@ -215,7 +219,7 @@ def record_stats(root, args, seconds):
     if os.environ.get("NQ_STATS", "1").lower() in ("0", "off", "false", "no"):
         return
     words = getattr(args, "keyword", None)
-    if args.cmd != "run" and not (args.cmd == "list" and words):
+    if args.cmd not in ("run", "batch") and not (args.cmd == "list" and words):
         return
     try:
         path = stats_path(root)
@@ -234,7 +238,14 @@ def record_stats(root, args, seconds):
             now = "datetime('now', 'localtime')"
             ms = round(seconds * 1000, 1)
             r = LAST_RESULT
-            if args.cmd == "run":
+            if args.cmd == "batch":  # one row per item; the item that failed carries the error
+                cur = None
+                for row in BATCH_LOG:
+                    cur = con.execute(f"INSERT INTO runs VALUES ({now}, ?, ?, ?, ?, ?, ?)", row)
+                table = "runs"
+                if cur is None:
+                    return
+            elif args.cmd == "run":
                 cur = con.execute(f"INSERT INTO runs VALUES ({now}, ?, ?, ?, ?, ?, ?)",
                                   (args.name, r.get("mode"), ms, r.get("row_count"), 1 if r.get("ok") else 0,
                                    (str(r["error"])[:200] if r.get("error") else None)))
@@ -556,21 +567,25 @@ def similar_queries(root, name):
     return {"did_you_mean": close} if close else {}
 
 
-def cmd_run(args, root):
-    name = args.name
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+", name):
-        fail(name, "invalid query name")
+class Problem(Exception):
+    """A query that cannot be run as asked: .error is the message, .details the rest of the error JSON."""
+
+    def __init__(self, error, **details):
+        super().__init__(error)
+        self.error, self.details = error, details
+
+
+def prepare(root, name, params, raw=None):
+    """Load db/queries/<name>.sql and bind `params` to it: (parsed query, bound values). Raises Problem."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", name or ""):
+        raise Problem("invalid query name")
     path = os.path.join(root, "db", "queries", name + ".sql")
     if not os.path.isfile(path):
-        fail(name, f"unknown query: {name}", **similar_queries(root, name), hint=LIST_HINT)
+        raise Problem(f"unknown query: {name}", **similar_queries(root, name), hint=LIST_HINT)
     q = parse_query(path)
     if q["declaredMode"] == "read" and q["inferredMode"] == "write":
-        fail(name, "query declares mode: read but contains write statements")
-    try:
-        raw = {}
-        params = collect_params(args, raw)
-    except (ValueError, OSError) as e:
-        fail(name, f"invalid params: {e}")
+        raise Problem("query declares mode: read but contains write statements")
+    params = dict(params)
     # A parameter declared optional may be left out; it is then bound as null (pair it with coalesce(:p, col) to mean
     # "keep as is"). There are no other defaults: anything else must be passed.
     for p in q["params"]:
@@ -584,48 +599,72 @@ def cmd_run(args, root):
         about = {"description": q["description"], "params": param_info(q)}
         if q["notes"]:
             about["notes"] = q["notes"]
-        fail(name, "parameter mismatch", missing=missing, unexpected=extra, expected=q["params"], **about, hint=LIST_HINT)
+        raise Problem("parameter mismatch", missing=missing, unexpected=extra, expected=q["params"], **about, hint=LIST_HINT)
     try:
         bound = bind_values(q, params, raw)
     except ValueError as e:
-        fail(name, str(e), params=param_info(q))
+        raise Problem(str(e), params=param_info(q))
+    if q["mode"] == "read" and len(q["statements"]) != 1:
+        raise Problem("a read query must contain exactly one statement")
+    return q, bound
+
+
+def run_write(con, name, q, bound, max_rows):
+    """Run a write query's statements on `con` (inside the caller's transaction); the result without exports."""
+    affected, returned = 0, []
+    for stmt, code in zip(q["statements"], q["code"]):
+        own = {p: bound[p] for p in PARAM.findall(code)}
+        cur = con.execute(stmt, own)
+        if cur.description:
+            returned.extend(dict(r) for r in cur.fetchall())
+        if cur.rowcount and cur.rowcount > 0:
+            affected += cur.rowcount
+    res = {"ok": True, "query": name, "mode": "write", "affected_rows": affected}
+    if affected == 0 and not returned:
+        res["warning"] = "no rows were changed; if a change was expected, check the parameters (for example the id)"
+    if returned:
+        res["rows"] = returned[:max_rows]
+        res["row_count"] = len(res["rows"])
+        if q["column_docs"]:
+            res["columns"] = q["column_docs"]
+    return res, returned
+
+
+def run_read(con, name, q, bound, max_rows):
+    cur = con.execute(q["statements"][0], {p: bound[p] for p in q["params"]})
+    rows = cur.fetchmany(max_rows + 1)
+    res = {"ok": True, "query": name, "mode": "read", "rows": [dict(r) for r in rows[:max_rows]],
+           "row_count": min(len(rows), max_rows), "truncated": len(rows) > max_rows}
+    if q["column_docs"]:
+        res["columns"] = q["column_docs"]
+    return res, [dict(r) for r in rows]
+
+
+def cmd_run(args, root):
+    name = args.name
+    try:
+        raw = {}
+        params = collect_params(args, raw)
+    except (ValueError, OSError) as e:
+        fail(name, f"invalid params: {e}")
+    try:
+        q, bound = prepare(root, name, params, raw)
+    except Problem as p:
+        fail(name, p.error, **p.details)
     read_only = q["mode"] == "read"
-    if read_only and len(q["statements"]) != 1:
-        fail(name, "a read query must contain exactly one statement")
     try:
         con = connect(db_path(root, args.db), read_only)
     except sqlite3.Error as e:
         fail(name, str(e))
     try:
         if read_only:
-            cur = con.execute(q["statements"][0], {p: bound[p] for p in q["params"]})
-            rows = cur.fetchmany(args.max_rows + 1)
-            truncated = len(rows) > args.max_rows
-            out = [dict(r) for r in rows[:args.max_rows]]
+            res, all_rows = run_read(con, name, q, bound, args.max_rows)
             if args.raw:
-                emit_raw(name, [dict(r) for r in rows], args.raw)
-            res = {"ok": True, "query": name, "mode": "read", "rows": out, "row_count": len(out), "truncated": truncated}
-            if q["column_docs"]:
-                res["columns"] = q["column_docs"]
+                emit_raw(name, all_rows, args.raw)
             emit(res)
         con.execute("BEGIN IMMEDIATE")
-        affected, returned = 0, []
-        for stmt, code in zip(q["statements"], q["code"]):
-            own = {p: bound[p] for p in PARAM.findall(code)}
-            cur = con.execute(stmt, own)
-            if cur.description:
-                returned.extend(dict(r) for r in cur.fetchall())
-            if cur.rowcount and cur.rowcount > 0:
-                affected += cur.rowcount
+        res, returned = run_write(con, name, q, bound, args.max_rows)
         con.execute("COMMIT")
-        res = {"ok": True, "query": name, "mode": "write", "affected_rows": affected}
-        if affected == 0 and not returned:
-            res["warning"] = "no rows were changed; if a change was expected, check the parameters (for example the id)"
-        if returned:
-            res["rows"] = returned[:args.max_rows]
-            res["row_count"] = len(res["rows"])
-            if q["column_docs"]:
-                res["columns"] = q["column_docs"]
         if q["exports"]:
             try:
                 res["exports"] = [run_export(root, args.db, ex, bound, raw) for ex in q["exports"]]
@@ -643,6 +682,69 @@ def cmd_run(args, root):
             pass
         locked = isinstance(e, sqlite3.OperationalError) and re.search(r"locked|busy", str(e), re.I)
         fail(name, str(e), rolled_back=not read_only, **({"hint": LOCK_HINT} if locked and not read_only else {}))
+
+
+BATCH_LOG = []  # one (query, mode, ms, rows, ok, error) per batch item, for record_stats
+
+
+def cmd_batch(args, root):
+    """Run several named queries from a JSON file, [{"query": NAME, "params": {...}}, ...], in one transaction:
+    every item is checked before anything runs, writes are all-or-nothing, and exports run once after the commit."""
+    try:
+        with open(args.file, encoding="utf-8-sig") as fh:
+            items = json.load(fh)
+    except (OSError, ValueError) as e:
+        fail(None, f"cannot read batch file: {e}")
+    if not isinstance(items, list) or not items:
+        fail(None, 'a batch file is a non-empty JSON array: [{"query": "name", "params": {...}}, ...]')
+    prepared = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or not isinstance(item.get("query"), str) or not isinstance(item.get("params", {}), dict):
+            fail(None, f"item {i}: expected {{\"query\": \"name\", \"params\": {{...}}}}", item=i)
+        try:
+            prepared.append(prepare(root, item["query"], item.get("params", {})))
+        except Problem as p:
+            fail(item["query"], f"item {i}: {p.error}; nothing was run", item=i, **p.details)
+    try:
+        con = connect(db_path(root, args.db), False)
+    except sqlite3.Error as e:
+        fail(None, str(e))
+    results, i = [], 0
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for i, (item, (q, bound)) in enumerate(zip(items, prepared)):
+            started = time.perf_counter()
+            if q["mode"] == "read":
+                res, _ = run_read(con, item["query"], q, bound, args.max_rows)
+            else:
+                res, _ = run_write(con, item["query"], q, bound, args.max_rows)
+            BATCH_LOG.append((item["query"], q["mode"], round((time.perf_counter() - started) * 1000, 1),
+                              res.get("row_count"), 1, None))
+            results.append(res)
+        con.execute("COMMIT")
+    except (sqlite3.Error, ValueError, TypeError, OverflowError) as e:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        BATCH_LOG.append((items[i]["query"], prepared[i][0]["mode"], None, None, 0, str(e)[:200]))
+        locked = isinstance(e, sqlite3.OperationalError) and re.search(r"locked|busy", str(e), re.I)
+        fail(items[i]["query"], f"item {i}: {e}", item=i, rolled_back=True, **({"hint": LOCK_HINT} if locked else {}))
+    # Exports after the commit, in item order; the same export with the same parameters runs once.
+    done, out = set(), {"ok": True, "results": results}
+    for res, (q, bound) in zip(results, prepared):
+        for ex in q["exports"] if q["mode"] == "write" else []:
+            try:
+                ep = parse_query(os.path.join(root, "db", "exports", ex + ".sql"))["params"]
+                key = (ex, json.dumps({p: bound.get(p) for p in ep}, sort_keys=True, default=str))
+                if key in done:
+                    continue
+                done.add(key)
+                res.setdefault("exports", []).append(run_export(root, args.db, ex, bound))
+            except (sqlite3.Error, ValueError, OSError) as e:
+                out.update(ok=False, error=f"writes committed but export failed: {e}")
+                emit(out, 1)
+    emit(out)
 
 
 def migrations(root):
@@ -1081,6 +1183,9 @@ def main():
     st.add_argument("--query", help="only queries whose name matches this (case-insensitive regex, e.g. '^task_')")
     st.add_argument("--table", help="only queries whose SQL uses this table")
     st.add_argument("--recent", type=int, default=0, metavar="N", help="show the latest N runs one by one instead of totals")
+    bt = sub.add_parser("batch")
+    bt.add_argument("--file", required=True, help='JSON array [{"query": "name", "params": {...}}, ...] (UTF-8)')
+    bt.add_argument("--max-rows", type=int, default=200)
     d = sub.add_parser("dump")
     d.add_argument("--out", help="where to write the SQL text (default: <root>/db/dump/project.sql, kept out of git)")
     d.add_argument("--exclude", action="append", metavar="TABLE",
@@ -1101,7 +1206,7 @@ def main():
     try:
         try:
             {"list": cmd_list, "run": cmd_run, "migrate": cmd_migrate, "status": cmd_status, "export": cmd_export,
-             "check": cmd_check, "backup": cmd_backup, "stats": cmd_stats, "dump": cmd_dump,
+             "check": cmd_check, "backup": cmd_backup, "stats": cmd_stats, "dump": cmd_dump, "batch": cmd_batch,
              "restore": cmd_restore}[args.cmd](args, root)
         except SystemExit:
             raise

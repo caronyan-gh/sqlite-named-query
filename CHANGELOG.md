@@ -7,6 +7,8 @@
 Output of existing commands is unchanged apart from new keys (`optional` in parameter info, `warning` on writes that changed nothing, `hint` on lock failures); the behavior changes are that a wrong `--root` and a folder given as `--db` are now errors.
 
 ### Added
+- `nq.py batch --file F`: several named queries from one JSON file, `[{"query": NAME, "params": {...}}, ...]`, in one transaction. Every item is checked before anything runs; writes are all-or-nothing; exports run once after the commit; results come back in order; each item is logged to the timing log.
+- SKILL.md: on Windows, command-line text arrives intact and garbling comes from reading UTF-8 output as cp932 (`PYTHONUTF8=1`, or read as UTF-8); prefer files to heredocs for parameters.
 - Optional parameters: `-- param NAME optional: …` lets a caller leave the parameter out; it is then bound as null (use `coalesce(:NAME, col)` for "keep as is"). Null is the only default; undeclared parameters are still required.
 - `nq.py dump [--out FILE]` writes the whole database as SQL text: tables by name, rows in primary-key order, then indexes, views and triggers, so the same database gives the same text. Default `db/dump/project.sql` in a folder with its own `.gitignore`. Tables listed in `db/dump-exclude.txt` (or `--exclude`) keep their schema but not their rows; rowids are kept. `nq.py restore FILE` builds the database from it (never overwrites an existing one), checks foreign keys, and runs `check`.
 - `NQ_BUSY_TIMEOUT_MS` sets how long a connection waits for another writer's lock (default 5000). A write that fails on a lock returns a `hint`: it was not applied, and the state should be read before running it again.
